@@ -1,0 +1,86 @@
+# GridSnap 設定ファイル
+# exe と同じディレクトリに gridsnap.toml として配置する
+
+# ─────────────────────────────
+# F1: グリッド定義（全モニター共通）
+# ─────────────────────────────
+[grid]
+columns = 8   # 横方向のグリッド数
+rows    = 4   # 縦方向のグリッド数
+
+# ─────────────────────────────
+# モニター別グリッド上書き（オプション）
+# キーは GetMonitorInfoW の szDevice 値
+# 例: "\\\\.\\DISPLAY1"
+# ─────────────────────────────
+# [monitor_grids."\\\\.\\ DISPLAY1"]
+# columns = 16
+# rows    = 8
+
+# ─────────────────────────────
+# F4: グリッドオーバーレイ
+# ─────────────────────────────
+[overlay]
+enabled    = true
+color_argb = 0x40_00_80_FF  # ARGB: 半透明の青
+
+# ─────────────────────────────
+# F5: タイトルバー非表示（対象クラス名リスト）
+# ─────────────────────────────
+[titlebar]
+hide_for_classes = []
+# 例: hide_for_classes = ["Chrome_WidgetWin_1", "MozillaWindowClass"]
+
+# ─────────────────────────────
+# F0: 自動配置の除外クラス名
+# ─────────────────────────────
+auto_place_exclude = [
+    "Shell_TrayWnd",
+    "NotifyIconOverflowWindow",
+    "tooltips_class32",
+]
+
+# ─────────────────────────────
+# F0: アプリ別配置ルール（app_rules）
+# col / row は 0-indexed（左上原点）
+# col_span / row_span は占有グリッド数
+# ─────────────────────────────
+
+# 例: VS Code を左半分（col 0-3, 全行）に固定（全モニター共通）
+# [[app_rules]]
+# exe_name  = "Code.exe"
+# col       = 0
+# row       = 0
+# col_span  = 4
+# row_span  = 4
+
+# 例: VS Code をモニター別に配置
+# DISPLAY1（ウルトラワイド）では左半分
+# [[app_rules]]
+# monitor   = "DISPLAY1"
+# exe_name  = "Code.exe"
+# col       = 0
+# row       = 0
+# col_span  = 4
+# row_span  = 4
+
+# DISPLAY2（サブモニター）ではフルスクリーン
+# [[app_rules]]
+# monitor   = "DISPLAY2"
+# exe_name  = "Code.exe"
+# col       = 0
+# row       = 0
+# col_span  = 8
+# row_span  = 4
+
+# 例: ターミナルを右下 1/4 に固定（全モニター共通）
+# [[app_rules]]
+# class_name = "CASCADIA_HOSTING_WINDOW_CLASS"
+# col        = 6
+# row        = 2
+# col_span   = 2
+# row_span   = 2
+
+# ★ monitor フィールドは部分一致。"DISPLAY1" で "\\\\.\\DISPLAY1" にマッチする。
+# ★ monitor 省略時は全モニター共通ルール。
+# ★ モニター固有ルールが共通ルールより優先される。

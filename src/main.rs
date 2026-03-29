@@ -1,0 +1,95 @@
+#![allow(warnings)]
+
+mod config;
+mod grid;
+
+// ──── Windows modules ────
+#[cfg(target_os = "windows")]
+mod monitor;
+#[cfg(target_os = "windows")]
+mod snap;
+#[cfg(target_os = "windows")]
+mod event_hook;
+#[cfg(target_os = "windows")]
+mod overlay;
+#[cfg(target_os = "windows")]
+mod auto_place;
+#[cfg(target_os = "windows")]
+mod titlebar;
+
+// ──── macOS modules ────
+#[cfg(target_os = "macos")]
+mod mac_ffi;
+#[cfg(target_os = "macos")]
+mod mac_monitor;
+#[cfg(target_os = "macos")]
+mod mac_snap;
+#[cfg(target_os = "macos")]
+pub mod mac_overlay; // pub に変更
+#[cfg(target_os = "macos")]
+pub mod mac_event_hook; // pub: mac_tray から update_config を呼ぶため
+#[cfg(target_os = "macos")]
+mod mac_tray;
+
+use anyhow::Result;
+use config::Config;
+
+#[cfg(target_os = "windows")]
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
+use event_hook::EventHookManager;
+
+fn main() -> Result<()> {
+    env_logger::init();
+
+    let config = Config::load()?;
+    eprintln!(
+        "[GridSnap] Started. Grid: {}x{}",
+        config.grid.columns, config.grid.rows,
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        let config = Arc::new(Mutex::new(config));
+
+        // イベントフックを起動し、メッセージループで待機する
+        let _hook_manager = EventHookManager::new(Arc::clone(&config))?;
+
+        // Win32 メッセージループ
+        // SetWinEventHook はフックを登録したスレッドのメッセージループが必要
+        message_loop();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // AXObserver + CFRunLoop でイベント駆動
+        let config_clone = config.clone();
+        let _hook_manager = mac_event_hook::EventHookManager::new(config)?;
+        // NSApplication 初期化後、run の前にトレイを設置
+        eprintln!("[GridSnap] About to call mac_tray::setup...");
+        mac_tray::setup(&config_clone);
+        eprintln!("[GridSnap] mac_tray::setup returned OK");
+        mac_event_hook::run_loop();
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        anyhow::bail!("Unsupported platform");
+    }
+
+    Ok(())
+}
+
+/// Win32 メッセージループ。
+/// WM_QUIT を受け取るまでブロックする。
+#[cfg(target_os = "windows")]
+fn message_loop() {
+    use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, TranslateMessage, DispatchMessageW, MSG};
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}

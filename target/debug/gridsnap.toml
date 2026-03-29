@@ -1,0 +1,48 @@
+auto_place_exclude = [
+    "Shell_TrayWnd",
+    "NotifyIconOverflowWindow",
+    "tooltips_class32",
+]
+
+[grid]
+columns = 20
+rows = 12
+
+[monitor_grids]
+
+[[app_rules]]
+exe_name = "Code"
+col = 13
+row = 6
+col_span = 7
+row_span = 6
+
+[[app_rules]]
+exe_name = "Google Chrome"
+col = 0
+row = 0
+col_span = 7
+row_span = 6
+
+[[app_rules]]
+monitor = "2"
+exe_name = "Google Chrome"
+col = 0
+row = 0
+col_span = 3
+row_span = 12
+
+[[app_rules]]
+monitor = "2"
+exe_name = "Notion"
+col = 0
+row = 6
+col_span = 7
+row_span = 6
+
+[overlay]
+enabled = true
+color_argb = 1073774847
+
+[titlebar]
+hide_for_classes = []
