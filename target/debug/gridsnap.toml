@@ -40,6 +40,38 @@ row = 6
 col_span = 7
 row_span = 6
 
+[[app_rules]]
+monitor = '\\.\DISPLAY2'
+exe_name = "gridsnap.exe"
+col = 0
+row = 0
+col_span = 1
+row_span = 1
+
+[[app_rules]]
+monitor = '\\.\DISPLAY2'
+exe_name = "explorer.exe"
+col = 17
+row = 11
+col_span = 3
+row_span = 1
+
+[[app_rules]]
+monitor = '\\.\DISPLAY2'
+exe_name = "chrome.exe"
+col = 0
+row = 0
+col_span = 8
+row_span = 8
+
+[[app_rules]]
+monitor = '\\.\DISPLAY1'
+exe_name = "chrome.exe"
+col = 1
+row = 3
+col_span = 18
+row_span = 9
+
 [overlay]
 enabled = true
 color_argb = 1073774847

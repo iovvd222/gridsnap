@@ -9,15 +9,18 @@ use windows::Win32::{
         GetForegroundWindow,
         GetWindowRect,
         GetClassNameW,
+        GetWindowLongW,
         IsWindowVisible,
-        SetWindowPos,
-        SWP_NOZORDER, SWP_NOACTIVATE,
+        GWL_STYLE, GWL_EXSTYLE,
+        WS_POPUP, WS_CAPTION,
+        WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE,
     },
 };
 
 use crate::{
     config::{AppRule, Config},
     grid::Grid,
+    snap::set_window_pos_visible,
 };
 
 /// 自動配置を試みる。除外リストにマッチするか、不可視ウィンドウなら何もしない。
@@ -47,8 +50,54 @@ fn is_target_window(hwnd: HWND, config: &Config) -> bool {
         }
     }
 
-    // 除外クラス名チェック
+    // ── ウィンドウスタイルによるフィルタ ──
+    // ポップアップメニュー・ツールチップ・ドロップダウン等を除外する。
+    // これがないと EVENT_OBJECT_SHOW が拾う全ウィンドウ（Chrome ドロップダウン、
+    // 右クリックメニュー、トレイメニュー等）にグリッドスナップが適用されてしまう。
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+        // WS_EX_TOOLWINDOW: トレイ隠しウィンドウ、ツールチップ、フロート系
+        if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
+            return false;
+        }
+
+        // WS_EX_NOACTIVATE: 通知バナー、一部のポップアップ
+        if (ex_style & WS_EX_NOACTIVATE.0) != 0 {
+            return false;
+        }
+
+        // WS_POPUP かつキャプション（タイトルバー）なし
+        // → メニュー (#32768)、ドロップダウン、ツールチップ、スプラッシュ等
+        // WS_POPUP + WS_CAPTION のウィンドウ（例: ダイアログ）は通す
+        if (style & WS_POPUP.0) != 0 && (style & WS_CAPTION.0) == 0 {
+            return false;
+        }
+    }
+
+    // ── クラス名チェック ──
     let class_name = get_class_name(hwnd);
+
+    // Win32 システムクラスを明示除外（スタイルフィルタの安全ネット）
+    const SYSTEM_EXCLUDE: &[&str] = &[
+        "#32768",            // Win32 メニュー
+        "tooltips_class32",  // ツールチップ
+        "#32770",            // コモンダイアログ（一部はキャプション付きだがここで除外）
+    ];
+    for &sys in SYSTEM_EXCLUDE {
+        if class_name == sys {
+            return false;
+        }
+    }
+
+    // UWP / WinUI アプリは SetWindowPos で描画が壊れるため除外
+    if class_name.contains("ApplicationFrameWindow")
+        || class_name.contains("Windows.UI.Core.CoreWindow")
+    {
+        return false;
+    }
+
     for excluded in &config.auto_place_exclude {
         if class_name.contains(excluded.as_str()) {
             return false;
@@ -114,19 +163,10 @@ fn find_matching_rule<'a>(
 }
 
 /// ルール通りにウィンドウを配置する。
+/// DWM 不可視ボーダーを自動補償し、可視部分がグリッドに揃う。
 fn apply_rule(hwnd: HWND, grid: &Grid, rule: &AppRule) {
     let rect = grid.cell_rect(rule.col, rule.row, rule.col_span, rule.row_span);
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            rect.x,
-            rect.y,
-            rect.w,
-            rect.h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-    }
+    set_window_pos_visible(hwnd, rect.x, rect.y, rect.w, rect.h);
 }
 
 /// アクティブウィンドウの右隣グリッドセルに新規ウィンドウを配置する。
@@ -154,17 +194,7 @@ fn place_next_to_active(hwnd: HWND, grid: &Grid) {
     let next_col = right_col.min(grid.columns - 1);
 
     let rect = grid.cell_rect(next_col as u32, 0, 1, grid.rows as u32);
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            rect.x,
-            rect.y,
-            rect.w,
-            rect.h,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-    }
+    set_window_pos_visible(hwnd, rect.x, rect.y, rect.w, rect.h);
 }
 
 /// HWND のウィンドウクラス名を取得する。
@@ -191,7 +221,7 @@ fn get_exe_name(hwnd: HWND) -> String {
             Err(_) => return String::new(),
         };
         let mut buf = [0u16; 260];
-        let len = GetModuleFileNameExW(handle, None, &mut buf);
+        let len = GetModuleFileNameExW(Some(handle), None, &mut buf);
         let full = String::from_utf16_lossy(&buf[..len as usize]);
         // ベース名だけを返す
         full.split(['\\', '/']).last().unwrap_or("").to_string()

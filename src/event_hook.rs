@@ -1,455 +1,462 @@
-//! macOS イベントフック管理 (AXObserver + CFRunLoop).
-//! Windows の event_hook.rs に対応する macOS 実装。
-//!
-//! 設計:
-//! - 各 GUI アプリの PID ごとに AXObserver を作成
-//! - AXWindowMoved / AXWindowResized / AXWindowCreated を購読
-//! - ドラッグ中（マウスボタン押下中）はスナップを保留し、
-//!   150ms タイマーでマウスリリース後にスナップを適用（デバウンス）
-//! - 3秒タイマーで新規アプリを検出し Observer を追加
+/// SetWinEventHook による EVENT_SYSTEM_MOVESIZEEND / EVENT_OBJECT_SHOW の購読。
+/// フックコールバックはメッセージループと同一スレッドで呼ばれる。
 
-use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::os::raw::c_void;
+use anyhow::{Context, Result};
+use std::sync::{Arc, Mutex};
+use windows::Win32::{
+    Foundation::{HWND, RECT},
+    UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
+    UI::WindowsAndMessaging::{
+        GetWindowRect,
+        EVENT_OBJECT_SHOW, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+        WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+        WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_BOTTOM,
+        WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT,
+    },
+};
 
-use crate::config::Config;
-use crate::mac_ffi::*;
+#[cfg(target_os = "macos")]
+use crate::mac_ffi;
+#[cfg(target_os = "macos")]
 use crate::mac_monitor;
+#[cfg(target_os = "macos")]
 use crate::mac_snap;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use objc;
 
-// ──── Send ラッパー（CoreFoundation ポインタ用）────
-// macOS の AX/CF ポインタはメインスレッド専用だが、
-// 本アプリはシングルスレッド（CFRunLoop）で動作するため安全。
+use crate::{
+    auto_place,
+    config::Config,
+    monitor::monitor_for_window,
+    overlay::OverlayWindow,
+    snap::apply_snap,
+};
 
-#[derive(Clone, Copy)]
-struct SendPtr(*const c_void);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
-
-impl SendPtr {
-    fn as_ax(self) -> AXUIElementRef { self.0 }
-    fn as_observer(self) -> AXObserverRef { self.0 }
+/// フックハンドルをまとめて管理し、Drop 時に解除する。
+pub struct EventHookManager {
+    hooks: Vec<HWINEVENTHOOK>,
 }
 
-// ──── Global state ────
-
-struct HookState {
-    config: Config,
-    observers: HashMap<i32, SendPtr>, // pid -> observer (wrapped)
+impl Drop for EventHookManager {
+    fn drop(&mut self) {
+        unsafe {
+            for h in &self.hooks {
+                let _ = UnhookWinEvent(*h);
+            }
+        }
+    }
 }
 
-/// 保留中のスナップ情報
-struct PendingSnap {
-    window: SendPtr, // CFRetain 済み
-    timestamp: f64,
-}
-
-static STATE: Mutex<Option<HookState>> = Mutex::new(None);
-static PENDING: Mutex<Option<PendingSnap>> = Mutex::new(None);
-static OVERLAY: Mutex<Option<crate::mac_overlay::OverlayWindow>> = Mutex::new(None);
-
-/// ドラッグ中フラグ（CGEventTap が管理）。
-/// ax_callback はこのフラグを参照してオーバーレイ制御をスキップする。
-static DRAGGING: AtomicBool = AtomicBool::new(false);
-
-// ──── Public API ────
-
-pub struct EventHookManager;
+// コールバックからアクセスする global state
+// メッセージループと同スレッドなので Mutex で十分
+static CONFIG: Mutex<Option<Arc<Mutex<Config>>>> = Mutex::new(None);
+static OVERLAY: Mutex<Option<Arc<Mutex<OverlayWindow>>>> = Mutex::new(None);
+/// ドラッグ開始時のウィンドウ矩形（辺推定用）
+static PRE_DRAG_RECT: Mutex<Option<RECT>> = Mutex::new(None);
 
 impl EventHookManager {
-    pub fn new(config: Config) -> Result<Self> {
-        // アクセシビリティ権限チェック
-        if !unsafe { AXIsProcessTrusted() } {
-            eprintln!("[GridSnap] ⚠️  アクセシビリティ権限が必要です。");
-            eprintln!(
-                "[GridSnap] システム設定 → プライバシーとセキュリティ → アクセシビリティ で GridSnap を許可してください。"
-            );
-            anyhow::bail!(
-                "Accessibility permission not granted. \
-                 Enable in System Settings → Privacy & Security → Accessibility."
-            );
-        }
-        eprintln!("[GridSnap] Accessibility permission OK");
+    pub fn new(config: Arc<Mutex<Config>>) -> Result<Self> {
+        // global state に格納
+        *CONFIG.lock().unwrap() = Some(Arc::clone(&config));
 
-        *STATE.lock().unwrap() = Some(HookState {
-            config,
-            observers: HashMap::new(),
-        });
+        // オーバーレイウィンドウを作成
+        let overlay = Arc::new(Mutex::new(OverlayWindow::new()?));
+        *OVERLAY.lock().unwrap() = Some(Arc::clone(&overlay));
 
-        // NSPanel を作る前に NSApplication を初期化する。
-        // [NSApplication sharedApplication] は冪等なので run_loop() と二重呼び出しになっても安全。
-        // これより前に呼ばれていないと initWithContentRect が nil を返し overlay が機能しない。
+        let mut hooks = Vec::new();
+
         unsafe {
-            use objc::{class, msg_send, sel, sel_impl};
-            let app: cocoa::base::id = msg_send![class!(NSApplication), sharedApplication];
-            // AccessoryPolicy: Dock に出さず、フォーカスを奪わない
-            let _: () = msg_send![app, setActivationPolicy:1isize];
-        }
-
-        match crate::mac_overlay::OverlayWindow::new() {
-            Ok(ov) => {
-                eprintln!("[GridSnap] mac_overlay created OK");
-                *OVERLAY.lock().unwrap() = Some(ov);
+            // F2/F3: リサイズ・移動完了
+            let h1 = SetWinEventHook(
+                EVENT_SYSTEM_MOVESIZEEND,
+                EVENT_SYSTEM_MOVESIZEEND,
+                None,
+                Some(on_move_size_end),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            if h1.is_invalid() {
+                anyhow::bail!("SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND) failed");
             }
-            Err(e) => {
-                eprintln!("[GridSnap] mac_overlay creation FAILED: {:?}", e);
+            hooks.push(h1);
+
+            // F4: ドラッグ開始 → オーバーレイ表示
+            let h_start = SetWinEventHook(
+                EVENT_SYSTEM_MOVESIZESTART,
+                EVENT_SYSTEM_MOVESIZESTART,
+                None,
+                Some(on_move_size_start),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            if h_start.is_invalid() {
+                anyhow::bail!("SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART) failed");
             }
+            hooks.push(h_start);
+
+            // F0: 新規ウィンドウ表示
+            let h2 = SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_SHOW,
+                None,
+                Some(on_object_show),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            if h2.is_invalid() {
+                anyhow::bail!("SetWinEventHook(EVENT_OBJECT_SHOW) failed");
+            }
+            hooks.push(h2);
         }
 
-        // 現在実行中の全 GUI アプリに Observer を登録
-        let pids = get_gui_app_pids();
-        eprintln!("[GridSnap] Found {} GUI apps", pids.len());
-        for pid in &pids {
-            register_observer(*pid);
-        }
-
-        // CGEventTap: ドラッグ中のオーバーレイ表示を駆動
-        install_event_tap();
-
-        // 150ms タイマー: 保留スナップのチェック
-        create_timer(0.15, snap_check_callback);
-
-        // 3秒タイマー: 新規アプリスキャン
-        create_timer(3.0, app_scan_callback);
-
-        Ok(Self)
+        Ok(Self { hooks })
     }
 }
 
-/// NSApplication の run_loop を実行する（ブロッキング）。
-pub fn run_loop() {
-    eprintln!("[GridSnap] Starting NSApplication run loop...");
-    unsafe {
-        use objc::{class, msg_send, sel, sel_impl};
-        let app: cocoa::base::id = msg_send![class!(NSApplication), sharedApplication];
-        // NSApplicationActivationPolicyAccessory = 1
-        let _: () = msg_send![app, setActivationPolicy:1isize];
-        let _: () = msg_send![app, run];
+/// EVENT_SYSTEM_MOVESIZESTART コールバック。
+/// ドラッグ開始時にオーバーレイを表示する。
+unsafe extern "system" fn on_move_size_start(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _event_time: u32,
+) {
+    eprintln!("[GridSnap] on_move_size_start fired");
+
+    // ドラッグ開始時の RECT を保存（辺推定用）
+    let mut rect = RECT::default();
+    if GetWindowRect(_hwnd, &mut rect).is_ok() {
+        *PRE_DRAG_RECT.lock().unwrap() = Some(rect);
+    }
+
+    let config_arc = match CONFIG.lock().unwrap().clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let config = config_arc.lock().unwrap();
+
+    if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
+        ov.lock().unwrap().show(&config);
     }
 }
 
-// ──── CGEventTap (ドラッグ中オーバーレイ) ────
+/// EVENT_SYSTEM_MOVESIZEEND コールバック。
+/// ドロップ直後に呼ばれるのでここでスナップを適用する。
+unsafe extern "system" fn on_move_size_end(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _event_time: u32,
+) {
+    eprintln!("[GridSnap] on_move_size_end fired: hwnd={:?}", hwnd);
 
-/// CGEventTap を作成し、メイン RunLoop に登録する。
-/// kCGEventLeftMouseDragged / kCGEventLeftMouseUp を ListenOnly で監視。
-fn install_event_tap() {
-    unsafe {
-        let mask: CGEventMask =
-            (1 << kCGEventLeftMouseDragged) | (1 << kCGEventLeftMouseUp);
+    // オーバーレイを非表示にする（ドラッグ終了）
+    if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
+        ov.lock().unwrap().hide();
+    }
 
-        let tap = CGEventTapCreate(
-            kCGSessionEventTap,
-            kCGHeadInsertEventTap,
-            kCGEventTapOptionListenOnly,
-            mask,
-            drag_event_callback,
-            std::ptr::null_mut(),
-        );
-        if tap.is_null() {
-            eprintln!("[GridSnap] ⚠️  CGEventTapCreate failed (accessibility permission?)");
+    let config_arc = match CONFIG.lock().unwrap().clone() {
+        Some(c) => c,
+        None => {
+            eprintln!("[GridSnap] on_move_size_end: CONFIG is None, returning");
             return;
         }
+    };
+    let config = config_arc.lock().unwrap();
 
-        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
-        if source.is_null() {
-            eprintln!("[GridSnap] ⚠️  CFMachPortCreateRunLoopSource failed");
+    let monitor = match monitor_for_window(hwnd) {
+        Some(m) => m,
+        None => {
+            eprintln!("[GridSnap] on_move_size_end: monitor_for_window returned None");
             return;
         }
-        CFRunLoopAddSource(
-            CFRunLoopGetCurrent(),
-            source,
-            kCFRunLoopDefaultMode,
-        );
-        eprintln!("[GridSnap] CGEventTap installed for drag overlay");
-    }
+    };
+    let grid = monitor.to_grid(&config);
+    eprintln!("[GridSnap] grid: {}x{}, cell={}x{}, origin=({},{})",
+        grid.columns, grid.rows, grid.cell_width(), grid.cell_height(),
+        grid.origin_x, grid.origin_y);
+
+    // ドラッグ開始時の RECT と比較してドラッグ辺を推定する
+    let drag_edge = infer_drag_edge(hwnd);
+    eprintln!("[GridSnap] inferred drag_edge: {:?}", drag_edge);
+    apply_snap(hwnd, &grid, drag_edge);
 }
 
-/// CGEventTap コールバック。
-/// ドラッグ中はマウス座標からグリッドを算出しオーバーレイを表示する。
-/// マウスリリースでオーバーレイを非表示にする。
-unsafe extern "C" fn drag_event_callback(
-    _proxy: *const c_void,
-    event_type: u32,
-    event: CGEventRef,
-    _user_info: *mut c_void,
-) -> CGEventRef {
-    match event_type {
-        kCGEventLeftMouseDragged => {
-            DRAGGING.store(true, Ordering::SeqCst);
-            let pos = CGEventGetLocation(event);
-            let state_guard = STATE.lock().unwrap();
-            if let Some(s) = state_guard.as_ref() {
-                if let Some(monitor) = mac_monitor::monitor_for_point(pos.x, pos.y) {
-                    let grid = monitor.to_grid(&s.config);
-                    if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
-                        ov.show(&grid);
-                    }
-                }
-            }
-        }
-        kCGEventLeftMouseUp => {
-            if DRAGGING.load(Ordering::SeqCst) {
-                DRAGGING.store(false, Ordering::SeqCst);
-                if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
-                    ov.hide();
-                }
-                // スナップは AXObserver の AXWindowMoved (リリース後に発火) に委譲
-            }
-        }
-        _ => {}
-    }
-    event
-}
-
-// ──── Timer creation ────
-
-fn create_timer(interval: f64, callback: CFRunLoopTimerCallBack) {
+/// ドラッグ前後の RECT を比較し、動いた辺から WMSZ_* を推定する。
+/// 全辺が同程度に動いていれば移動（None）と判定する。
+fn infer_drag_edge(hwnd: HWND) -> Option<u32> {
+    let pre = match PRE_DRAG_RECT.lock().unwrap().take() {
+        Some(r) => r,
+        None => return None, // 開始時 RECT がなければ移動扱い
+    };
+    let mut post = RECT::default();
     unsafe {
-        let mut ctx = CFRunLoopTimerContext {
-            version: 0,
-            info: std::ptr::null_mut(),
-            retain: None,
-            release: None,
-            copy_description: None,
+        if GetWindowRect(hwnd, &mut post).is_err() {
+            return None;
+        }
+    }
+
+    let dl = (post.left - pre.left).abs();
+    let dr = (post.right - pre.right).abs();
+    let dt = (post.top - pre.top).abs();
+    let db = (post.bottom - pre.bottom).abs();
+
+    const THRESH: i32 = 5; // ピクセル閾値
+
+    let left_moved = dl > THRESH;
+    let right_moved = dr > THRESH;
+    let top_moved = dt > THRESH;
+    let bottom_moved = db > THRESH;
+
+    // 移動判定: 左右の移動量がほぼ同じ かつ 上下の移動量がほぼ同じ
+    let is_move = (dl.abs_diff(dr) <= THRESH as u32) && (dt.abs_diff(db) <= THRESH as u32)
+        && (left_moved || top_moved);
+
+    if is_move {
+        return None; // 移動 → 左上基準スナップ
+    }
+
+    // リサイズ: 動いた辺の組み合わせから WMSZ_* を返す
+    match (left_moved, right_moved, top_moved, bottom_moved) {
+        (true,  false, false, false) => Some(WMSZ_LEFT),
+        (false, true,  false, false) => Some(WMSZ_RIGHT),
+        (false, false, true,  false) => Some(WMSZ_TOP),
+        (false, false, false, true)  => Some(WMSZ_BOTTOM),
+        (true,  false, true,  false) => Some(WMSZ_TOPLEFT),
+        (false, true,  true,  false) => Some(WMSZ_TOPRIGHT),
+        (true,  false, false, true)  => Some(WMSZ_BOTTOMLEFT),
+        (false, true,  false, true)  => Some(WMSZ_BOTTOMRIGHT),
+        _ => None, // 判定不能 → 移動扱い
+    }
+}
+
+// ──── Public: Config の動的更新 ────
+
+/// 外部（tray）から Config を更新する。
+/// クロージャ内で Config を変更し、変更後の Config を TOML に保存する。
+pub fn update_config<F: FnOnce(&mut Config)>(f: F) {
+    let config_arc = match CONFIG.lock().unwrap().clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let mut config = config_arc.lock().unwrap();
+    f(&mut config);
+    if let Err(e) = config.save() {
+        eprintln!("[GridSnap] Failed to save config: {:?}", e);
+    }
+    eprintln!(
+        "[GridSnap] Config updated: {}x{}",
+        config.grid.columns, config.grid.rows
+    );
+}
+
+/// F0a: 最前面の他プロセスウィンドウの位置をキャプチャし、app_rules に upsert する。
+/// トレイメニューの「Capture Position」から呼ばれる。
+/// Zオーダーを走査し、自プロセスのウィンドウをスキップして最初の可視トップレベルウィンドウを返す。
+/// 成功時はキャプチャ内容の文字列を返す。
+pub fn capture_window(_target: Option<HWND>) -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, GetClassNameW,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, GetCurrentProcessId, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
+    use windows::Win32::Foundation::RECT;
+
+    unsafe {
+        // Zオーダーを走査し、自プロセス以外の最前面可視ウィンドウを探す
+        let my_pid = GetCurrentProcessId();
+        let hwnd = find_topmost_foreign_window(my_pid);
+        let hwnd = match hwnd {
+            Some(h) => h,
+            None => {
+                eprintln!("[GridSnap] capture: no suitable target window found");
+                return None;
+            }
         };
-        let timer = CFRunLoopTimerCreate(
-            kCFAllocatorDefault,
-            CFAbsoluteTimeGetCurrent() + interval,
-            interval,
-            0,
-            0,
-            callback,
-            &mut ctx,
+
+        // exe 名を取得
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(_) => {
+                eprintln!("[GridSnap] capture: OpenProcess failed for pid {}", pid);
+                return None;
+            }
+        };
+        let mut buf = [0u16; 260];
+        let len = GetModuleFileNameExW(Some(handle), None, &mut buf);
+        let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+        let exe_name = full_path.split(['\\', '/']).last().unwrap_or("").to_string();
+        if exe_name.is_empty() {
+            eprintln!("[GridSnap] capture: could not get exe name for pid {}", pid);
+            return None;
+        }
+
+        // ウィンドウの可視矩形を取得（DWM 不可視ボーダーを除外）
+        let rect = match crate::snap::get_visible_rect(hwnd) {
+            Some(r) => r,
+            None => {
+                eprintln!("[GridSnap] capture: get_visible_rect failed");
+                return None;
+            }
+        };
+
+        // モニター検出 -> グリッド -> セル座標に変換
+        let monitor = match crate::monitor::monitor_for_window(hwnd) {
+            Some(m) => m,
+            None => {
+                eprintln!("[GridSnap] capture: no monitor for window");
+                return None;
+            }
+        };
+
+        let config_arc = match CONFIG.lock().unwrap().clone() {
+            Some(c) => c,
+            None => {
+                eprintln!("[GridSnap] capture: CONFIG not initialized");
+                return None;
+            }
+        };
+        let mut config = config_arc.lock().unwrap();
+        let grid = monitor.to_grid(&config);
+
+        let (col, row, col_span, row_span) = grid.rect_to_cell(
+            rect.left as f64,
+            rect.top as f64,
+            (rect.right - rect.left) as f64,
+            (rect.bottom - rect.top) as f64,
         );
-        CFRunLoopAddTimer(
-            CFRunLoopGetCurrent(),
-            timer,
-            kCFRunLoopDefaultMode,
+
+        // app_rules に upsert -> TOML 保存
+        let rule = crate::config::AppRule {
+            monitor: Some(monitor.device_name.clone()),
+            class_name: None,
+            exe_name: Some(exe_name.clone()),
+            col,
+            row,
+            col_span,
+            row_span,
+        };
+        config.upsert_app_rule(rule);
+        if let Err(e) = config.save() {
+            eprintln!("[GridSnap] capture: Failed to save config: {:?}", e);
+        }
+
+        let msg = format!(
+            "Captured: {} [{}] -> ({},{}) {}x{}",
+            exe_name, monitor.device_name, col, row, col_span, row_span
         );
+        eprintln!("[GridSnap] {}", msg);
+        Some(msg)
     }
 }
 
-// ──── GUI app PID enumeration ────
+/// EVENT_OBJECT_SHOW コールバック。
+/// 新規ウィンドウを検出し、F0 自動配置を適用する。
+unsafe extern "system" fn on_object_show(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _event_time: u32,
+) {
+    // OBJID_WINDOW (0) のみ対象
+    if id_object != 0 {
+        return;
+    }
 
-/// オンスクリーンの GUI アプリ PID を列挙する（レイヤー 0 のウィンドウ所有者）。
-fn get_gui_app_pids() -> Vec<i32> {
-    let mut pids = Vec::new();
+    // EVENT_OBJECT_SHOW ではオーバーレイを操作しない（F4 は MOVESIZESTART で処理）
+
+    let config_arc = match CONFIG.lock().unwrap().clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let config = config_arc.lock().unwrap();
+
+    let monitor = match monitor_for_window(hwnd) {
+        Some(m) => m,
+        None => return,
+    };
+    let grid = monitor.to_grid(&config);
+
+    auto_place::try_auto_place(hwnd, &grid, &config, &monitor.device_name);
+}
+
+/// Zオーダーを上から走査し、指定PID以外の最初の可視トップレベルウィンドウを返す。
+/// タスクバーやツールウィンドウ等、通常のアプリウィンドウでないものはスキップする。
+fn find_topmost_foreign_window(my_pid: u32) -> Option<HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GetDesktopWindow, IsWindowVisible,
+        GetWindowLongW, GetWindowThreadProcessId,
+        GW_CHILD, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE,
+    };
+
+    const WS_EX_TOOLWINDOW_RAW: i32 = 0x00000080;
+    const WS_VISIBLE_RAW: i32 = 0x10000000;
+    const WS_EX_NOACTIVATE_RAW: i32 = 0x08000000;
+
     unsafe {
-        let info = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID,
-        );
-        if info.is_null() {
-            return pids;
-        }
-        let count = CFArrayGetCount(info);
-        for i in 0..count {
-            let dict = CFArrayGetValueAtIndex(info, i) as CFDictionaryRef;
-            if dict.is_null() {
+        // デスクトップの最初の子 = Zオーダー最上位
+        let desktop = GetDesktopWindow();
+        let mut cur = GetWindow(desktop, GW_CHILD).ok();
+
+        while let Some(hwnd) = cur {
+            // 次へ進む準備
+            let next = GetWindow(hwnd, GW_HWNDNEXT).ok();
+
+            // 不可視ウィンドウをスキップ
+            if !IsWindowVisible(hwnd).as_bool() {
+                cur = next;
                 continue;
             }
 
-            // Layer 0（通常ウィンドウ）のみ
-            let layer_val =
-                CFDictionaryGetValue(dict, kCGWindowLayer as *const c_void);
-            if !layer_val.is_null() {
-                let mut layer: i32 = 0;
-                if CFNumberGetValue(
-                    layer_val as CFTypeRef,
-                    kCFNumberSInt32Type,
-                    &mut layer as *mut _ as *mut c_void,
-                ) != 0
-                    && layer != 0
-                {
+            // 自プロセスのウィンドウをスキップ
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == my_pid {
+                cur = next;
+                continue;
+            }
+
+            // ツールウィンドウ・NOACTIVATE をスキップ
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            if (ex_style & WS_EX_TOOLWINDOW_RAW) != 0 {
+                cur = next;
+                continue;
+            }
+            if (ex_style & WS_EX_NOACTIVATE_RAW) != 0 {
+                cur = next;
+                continue;
+            }
+
+            // サイズが 0 のウィンドウをスキップ
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_ok() {
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                if w <= 0 || h <= 0 {
+                    cur = next;
                     continue;
                 }
             }
 
-            // Owner PID
-            let pid_val =
-                CFDictionaryGetValue(dict, kCGWindowOwnerPID as *const c_void);
-            if !pid_val.is_null() {
-                let mut pid: i32 = 0;
-                if CFNumberGetValue(
-                    pid_val as CFTypeRef,
-                    kCFNumberSInt32Type,
-                    &mut pid as *mut _ as *mut c_void,
-                ) != 0
-                    && pid > 0
-                    && !pids.contains(&pid)
-                {
-                    pids.push(pid);
-                }
-            }
+            return Some(hwnd);
         }
-        CFRelease(info as CFTypeRef);
-    }
-    pids
-}
-
-// ──── Observer registration ────
-
-/// 指定 PID に対して AXObserver を登録する。
-fn register_observer(pid: i32) {
-    let mut state = STATE.lock().unwrap();
-    let state = match state.as_mut() {
-        Some(s) => s,
-        None => return,
-    };
-
-    if state.observers.contains_key(&pid) {
-        return;
-    }
-
-    unsafe {
-        let mut observer: AXObserverRef = std::ptr::null();
-        let err = AXObserverCreate(pid, ax_callback, &mut observer);
-        if err != kAXErrorSuccess || observer.is_null() {
-            return;
-        }
-
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            CFRelease(observer);
-            return;
-        }
-
-        // 通知を登録
-        let notifications = [
-            "AXWindowMoved",
-            "AXWindowResized",
-            "AXWindowCreated",
-        ];
-        for notif_name in &notifications {
-            let notif = cf_str(notif_name);
-            let err = AXObserverAddNotification(
-                observer,
-                app,
-                notif,
-                std::ptr::null_mut(),
-            );
-            CFRelease(notif);
-            if err != kAXErrorSuccess
-                && err != kAXErrorNotificationAlreadyRegistered
-            {
-                eprintln!(
-                    "[GridSnap] Failed to add {} for pid {}: err={}",
-                    notif_name, pid, err
-                );
-            }
-        }
-
-        // Run loop に追加
-        let source = AXObserverGetRunLoopSource(observer);
-        if !source.is_null() {
-            CFRunLoopAddSource(
-                CFRunLoopGetCurrent(),
-                source,
-                kCFRunLoopDefaultMode,
-            );
-        }
-
-        CFRelease(app);
-        state.observers.insert(pid, SendPtr(observer));
-        eprintln!("[GridSnap] Registered observer for pid {}", pid);
-    }
-}
-
-// ──── AXObserver callback ────
-
-/// AXObserver コールバック。
-/// ウィンドウの移動・リサイズ・生成を検出する。
-unsafe extern "C" fn ax_callback(
-    _observer: AXObserverRef,
-    element: AXUIElementRef,
-    notification: CFStringRef,
-    _refcon: *mut c_void,
-) {
-    let notif_str = cf_string_to_string(notification);
-
-    match notif_str.as_str() {
-        "AXWindowMoved" | "AXWindowResized" => {
-            // ドラッグ中（CGEventTap が DRAGGING を管理）はスナップを保留し、
-            // ウィンドウ参照だけ記録する。オーバーレイ表示は CGEventTap 側が担当。
-            if DRAGGING.load(Ordering::SeqCst) {
-                // 保留に保存（既存があれば CFRelease）
-                let mut pending = PENDING.lock().unwrap();
-                if let Some(old) = pending.take() {
-                    CFRelease(old.window.0);
-                }
-                CFRetain(element);
-                *pending = Some(PendingSnap {
-                    window: SendPtr(element),
-                    timestamp: CFAbsoluteTimeGetCurrent(),
-                });
-            } else {
-                // マウスリリース済み → 即座にスナップ
-                snap_window(element);
-            }
-        }
-        "AXWindowCreated" => {
-            eprintln!("[GridSnap] AXWindowCreated detected");
-            // F0: 新規ウィンドウ → グリッドにスナップ
-            snap_window(element);
-        }
-        _ => {}
-    }
-}
-
-/// ウィンドウにスナップを適用する（グリッド取得を含む）。
-fn snap_window(element: AXUIElementRef) {
-    let (x, y) = match mac_snap::get_window_position(element) {
-        Some(pos) => pos,
-        None => return,
-    };
-
-    let state = STATE.lock().unwrap();
-    let state = match state.as_ref() {
-        Some(s) => s,
-        None => return,
-    };
-
-    let monitor = match mac_monitor::monitor_for_point(x, y) {
-        Some(m) => m,
-        None => return,
-    };
-    let grid = monitor.to_grid(&state.config);
-
-    mac_snap::apply_snap(element, &grid);
-}
-
-// ──── Timer callbacks ────
-
-/// 150ms タイマー: 保留スナップを処理する。
-extern "C" fn snap_check_callback(
-    _timer: CFRunLoopTimerRef,
-    _info: *mut c_void,
-) {
-    let mut pending = PENDING.lock().unwrap();
-    if let Some(p) = pending.as_ref() {
-        let now = unsafe { CFAbsoluteTimeGetCurrent() };
-        // 最後のイベントから 100ms 経過かつマウスリリース済み
-        if now - p.timestamp > 0.1 && !mac_snap::is_mouse_down() {
-            if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
-                ov.hide();
-            }
-            let window = p.window;
-            snap_window(window.as_ax());
-            unsafe { CFRelease(window.0) };
-            *pending = None;
-        }
-    }
-}
-
-/// 3秒タイマー: 新規アプリをスキャンする。
-extern "C" fn app_scan_callback(
-    _timer: CFRunLoopTimerRef,
-    _info: *mut c_void,
-) {
-    let pids = get_gui_app_pids();
-    for pid in pids {
-        register_observer(pid);
+        None
     }
 }

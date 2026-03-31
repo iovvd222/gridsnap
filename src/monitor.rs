@@ -1,15 +1,14 @@
 /// モニター情報の取得。GetDpiForMonitor で物理ピクセル変換を行う。
 
 use anyhow::Result;
+use windows_core::BOOL;
 use windows::Win32::{
-    Foundation::{BOOL, LPARAM, RECT},
+    Foundation::{HWND, LPARAM, RECT},
     Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+        MonitorFromWindow, MONITOR_DEFAULTTONEAREST,
     },
     UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
-    UI::WindowsAndMessaging::MonitorFromWindow,
-    UI::WindowsAndMessaging::MONITOR_DEFAULTTONEAREST,
-    Foundation::HWND,
 };
 
 use crate::config::Config;
@@ -54,11 +53,16 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
 
     unsafe {
         EnumDisplayMonitors(
-            HDC::default(),
+            None,
             None,
             Some(enum_monitor_proc),
             LPARAM(ptr),
         );
+    }
+    eprintln!("[GridSnap] enumerate_monitors: found {} monitors", monitors.len());
+    for (i, m) in monitors.iter().enumerate() {
+        eprintln!("[GridSnap]   [{}] device={}, work_rect={:?}, dpi={}",
+            i, m.device_name, m.work_rect, m.dpi);
     }
     Ok(monitors)
 }
@@ -95,7 +99,7 @@ fn get_monitor_info(hmonitor: HMONITOR) -> Option<MonitorInfo> {
 
         let wr = info.monitorInfo.rcWork;
         Some(MonitorInfo {
-            handle: hmonitor.0,
+            handle: hmonitor.0 as isize,
             device_name,
             work_rect: (wr.left, wr.top, wr.right, wr.bottom),
             dpi,

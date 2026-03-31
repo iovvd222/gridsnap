@@ -16,6 +16,8 @@ mod overlay;
 mod auto_place;
 #[cfg(target_os = "windows")]
 mod titlebar;
+#[cfg(target_os = "windows")]
+mod tray;
 
 // ──── macOS modules ────
 #[cfg(target_os = "macos")]
@@ -40,6 +42,18 @@ use std::sync::{Arc, Mutex};
 use event_hook::EventHookManager;
 
 fn main() -> Result<()> {
+    // Per-Monitor DPI Aware V2: 全 Win32 API が物理ピクセル座標を返すようにする
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        let _ = SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+
     env_logger::init();
 
     let config = Config::load()?;
@@ -54,6 +68,10 @@ fn main() -> Result<()> {
 
         // イベントフックを起動し、メッセージループで待機する
         let _hook_manager = EventHookManager::new(Arc::clone(&config))?;
+
+        // システムトレイを設置（Columns/Rows 変更 + Capture Position）
+        let config_for_tray = config.lock().unwrap().clone();
+        let _tray_hwnd = tray::setup(&config_for_tray);
 
         // Win32 メッセージループ
         // SetWinEventHook はフックを登録したスレッドのメッセージループが必要

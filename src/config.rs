@@ -15,7 +15,7 @@ pub struct GridConfig {
 
 impl Default for GridConfig {
     fn default() -> Self {
-        Self { columns: 8, rows: 4 }
+        Self { columns: 20, rows: 12 }
     }
 }
 

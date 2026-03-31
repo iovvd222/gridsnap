@@ -12,16 +12,15 @@ use windows::Win32::{
     Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
         BeginPaint, CreateSolidBrush, DeleteObject, EndPaint,
-        FillRect, HMONITOR, PAINTSTRUCT,
+        FillRect, HMONITOR, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow,
-        GetClientRect, GetCursorPos, GetSystemMetricsForDpi,
-        GetWindowRect, MonitorFromWindow, RegisterClassExW,
+        GetClientRect, GetCursorPos,
+        GetWindowRect, RegisterClassExW,
         SendMessageW, SetWindowPos, ShowWindow,
         CS_HREDRAW, CS_VREDRAW,
-        MONITOR_DEFAULTTONEAREST,
         SC_MAXIMIZE, SC_MINIMIZE,
         SM_CYCAPTION, SM_CYFRAME,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
@@ -30,7 +29,7 @@ use windows::Win32::{
         WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
         WS_POPUP,
     },
-    UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+    UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
 };
 use windows_core::PCWSTR;
 
@@ -72,7 +71,7 @@ impl TitlebarHider {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
-        self.targets.lock().unwrap().push(hwnd.0);
+        self.targets.lock().unwrap().push(hwnd.0 as isize);
     }
 
     /// カーソル位置監視ループを別スレッドで起動する。
@@ -96,7 +95,7 @@ impl TitlebarHider {
                 let targets_snap = targets.lock().unwrap().clone();
 
                 for &raw in &targets_snap {
-                    let hwnd = HWND(raw);
+                    let hwnd = HWND(raw as *mut std::ffi::c_void);
                     unsafe {
                         let mut rect = RECT::default();
                         if GetWindowRect(hwnd, &mut rect).is_err() {
@@ -141,7 +140,7 @@ fn get_titlebar_height(hwnd: HWND) -> i32 {
         let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut dpi_x = 0u32;
         let mut dpi_y = 0u32;
-        let _ = GetDpiForMonitor(HMONITOR(hmonitor.0), MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let _ = GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
         let dpi = if dpi_x > 0 { dpi_x } else { 96 };
         GetSystemMetricsForDpi(SM_CYCAPTION, dpi)
             + GetSystemMetricsForDpi(SM_CYFRAME, dpi)
@@ -181,7 +180,7 @@ impl ControlOverlay {
                 PCWSTR::null(),
                 WS_POPUP,
                 0, 0, 120, 24,
-                None, None, hinstance, None,
+                None, None, Some(hinstance.into()), None,
             )?;
 
             Ok(Self {
@@ -192,7 +191,7 @@ impl ControlOverlay {
     }
 
     fn show_for(&self, target: HWND) {
-        *self.target.lock().unwrap() = Some(target.0);
+        *self.target.lock().unwrap() = Some(target.0 as isize);
         unsafe {
             let mut rect = RECT::default();
             if GetWindowRect(target, &mut rect).is_err() {
@@ -247,7 +246,7 @@ unsafe extern "system" fn ctrl_overlay_proc(
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc);
             FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
+            DeleteObject(bg.into());
             // テキスト描画は簡略化（本実装では DrawTextW 等を使う）
             EndPaint(hwnd, &ps);
             LRESULT(0)
