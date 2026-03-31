@@ -29,8 +29,8 @@ monitor = "2"
 exe_name = "Google Chrome"
 col = 0
 row = 0
-col_span = 3
-row_span = 12
+col_span = 7
+row_span = 9
 
 [[app_rules]]
 monitor = "2"
@@ -70,6 +70,14 @@ exe_name = "chrome.exe"
 col = 1
 row = 3
 col_span = 18
+row_span = 9
+
+[[app_rules]]
+monitor = "1"
+exe_name = "Google Chrome"
+col = 0
+row = 0
+col_span = 16
 row_span = 9
 
 [overlay]

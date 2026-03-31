@@ -4,8 +4,9 @@
 //! 設計:
 //! - 各 GUI アプリの PID ごとに AXObserver を作成
 //! - AXWindowMoved / AXWindowResized / AXWindowCreated を購読
-//! - ドラッグ中（マウスボタン押下中）はスナップを保留し、
-//!   150ms タイマーでマウスリリース後にスナップを適用（デバウンス）
+//! - ドラッグ開始時にオーバーレイを1回表示し、ドラッグ中は処理しない
+//! - マルチモニタードラッグ時はモニター境界越え時のみオーバーレイ更新
+//! - マウスリリース時にスナップを適用
 //! - 3秒タイマーで新規アプリを検出し Observer を追加
 
 use anyhow::Result;
@@ -56,11 +57,11 @@ static DRAGGING: AtomicBool = AtomicBool::new(false);
 
 /// ウィンドウ操作確認フラグ。
 /// ax_callback が DRAGGING 中に AXWindowMoved/AXWindowResized を受信したら true。
-/// true になった後は drag_event_callback がマウス座標でオーバーレイを滑らかに駆動する。
 static WINDOW_DRAGGING: AtomicBool = AtomicBool::new(false);
 
-/// ドラッグ中のマウス座標（CGEventTap が更新、タイマーが参照）。
-static MOUSE_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// 現在オーバーレイを表示中のモニター境界（CG座標）。
+/// ドラッグ中のモニター境界越え判定に使用する。
+static OVERLAY_BOUNDS: Mutex<Option<CGRect>> = Mutex::new(None);
 
 // ──── Public API ────
 
@@ -88,7 +89,6 @@ impl EventHookManager {
 
         // NSPanel を作る前に NSApplication を初期化する。
         // [NSApplication sharedApplication] は冪等なので run_loop() と二重呼び出しになっても安全。
-        // これより前に呼ばれていないと initWithContentRect が nil を返し overlay が機能しない。
         unsafe {
             use objc::{class, msg_send, sel, sel_impl};
             let app: cocoa::base::id = msg_send![class!(NSApplication), sharedApplication];
@@ -113,14 +113,11 @@ impl EventHookManager {
             register_observer(*pid);
         }
 
-        // CGEventTap: ドラッグ中のオーバーレイ表示を駆動
+        // CGEventTap: ドラッグ開始/終了・モニター境界越えを検出
         install_event_tap();
 
-        // 150ms タイマー: 保留スナップのチェック
+        // 150ms タイマー: 保留スナップの安全ネット（LeftMouseUp 取りこぼし対策）
         create_timer(0.15, snap_check_callback);
-
-        // 16ms タイマー: ウィンドウドラッグ中のオーバーレイ更新 (~60fps)
-        create_timer(0.016, overlay_update_callback);
 
         // 3秒タイマー: 新規アプリスキャン
         create_timer(3.0, app_scan_callback);
@@ -141,7 +138,7 @@ pub fn run_loop() {
     }
 }
 
-// ──── CGEventTap (ドラッグ中オーバーレイ) ────
+// ──── CGEventTap ────
 
 /// CGEventTap を作成し、メイン RunLoop に登録する。
 /// kCGEventLeftMouseDragged / kCGEventLeftMouseUp を ListenOnly で監視。
@@ -178,6 +175,8 @@ fn install_event_tap() {
 }
 
 /// CGEventTap コールバック。
+/// ドラッグ中: モニター境界越え時のみオーバーレイ更新。
+/// マウスアップ: オーバーレイ非表示 + スナップ実行。
 unsafe extern "C" fn drag_event_callback(
     _proxy: *const c_void,
     event_type: u32,
@@ -187,22 +186,68 @@ unsafe extern "C" fn drag_event_callback(
     match event_type {
         kCGEventLeftMouseDragged => {
             DRAGGING.store(true, Ordering::SeqCst);
+
+            // ウィンドウドラッグ中のみ、モニター境界越えをチェック
             if WINDOW_DRAGGING.load(Ordering::SeqCst) {
                 let point = CGEventGetLocation(event);
-                *MOUSE_POS.lock().unwrap() = (point.x, point.y);
+                let needs_update = {
+                    let bounds_guard = OVERLAY_BOUNDS.lock().unwrap();
+                    match bounds_guard.as_ref() {
+                        Some(bounds) => {
+                            let inside = point.x >= bounds.origin.x
+                                && point.x < bounds.origin.x + bounds.size.width
+                                && point.y >= bounds.origin.y
+                                && point.y < bounds.origin.y + bounds.size.height;
+                            !inside
+                        }
+                        None => true,
+                    }
+                }; // bounds_guard ロック解放
+                if needs_update {
+                    show_overlay_for_point(point.x, point.y);
+                }
             }
         }
         kCGEventLeftMouseUp => {
-            WINDOW_DRAGGING.store(false, Ordering::SeqCst);
-            if DRAGGING.swap(false, Ordering::SeqCst) {
+            let was_window_dragging = WINDOW_DRAGGING.swap(false, Ordering::SeqCst);
+            let was_dragging = DRAGGING.swap(false, Ordering::SeqCst);
+
+            if was_dragging {
+                // オーバーレイ非表示
                 if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
                     ov.hide();
+                }
+                *OVERLAY_BOUNDS.lock().unwrap() = None;
+
+                // ウィンドウドラッグだった場合、スナップ適用
+                if was_window_dragging {
+                    let pending = PENDING.lock().unwrap().take();
+                    if let Some(p) = pending {
+                        snap_window(p.window.as_ax());
+                        CFRelease(p.window.0);
+                    }
                 }
             }
         }
         _ => {}
     }
     event
+}
+
+/// 指定座標のモニターでオーバーレイを表示し、OVERLAY_BOUNDS を更新する。
+fn show_overlay_for_point(x: f64, y: f64) {
+    let state_guard = STATE.lock().unwrap();
+    if let Some(s) = state_guard.as_ref() {
+        if let Some(monitor) = mac_monitor::monitor_for_point(x, y)
+            .or_else(|| mac_monitor::monitor_nearest_point(x, y))
+        {
+            let grid = monitor.to_grid(&s.config);
+            *OVERLAY_BOUNDS.lock().unwrap() = Some(monitor.bounds);
+            if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
+                ov.show(&grid);
+            }
+        }
+    }
 }
 
 // ──── Timer creation ────
@@ -374,21 +419,17 @@ unsafe extern "C" fn ax_callback(
     match notif_str.as_str() {
         "AXWindowMoved" | "AXWindowResized" => {
             if DRAGGING.load(Ordering::SeqCst) {
-                WINDOW_DRAGGING.store(true, Ordering::SeqCst);
-                if let Some((wx, wy)) = mac_snap::get_window_position(element) {
-                    let state_guard = STATE.lock().unwrap();
-                    if let Some(s) = state_guard.as_ref() {
-                        if let Some(monitor) = mac_monitor::monitor_for_point(wx, wy)
-                            .or_else(|| mac_monitor::monitor_nearest_point(wx, wy))
-                        {
-                            let grid = monitor.to_grid(&s.config);
-                            if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
-                                ov.show(&grid);
-                            }
-                        }
+                // ドラッグ中: 初回のみオーバーレイ表示、以後は PENDING 更新のみ
+                let was_window_dragging = WINDOW_DRAGGING.swap(true, Ordering::SeqCst);
+
+                if !was_window_dragging {
+                    // 初回検出: ウィンドウ位置からモニターを特定しオーバーレイ表示
+                    if let Some((wx, wy)) = mac_snap::get_window_position(element) {
+                        show_overlay_for_point(wx, wy);
                     }
                 }
 
+                // PENDING を更新（スナップ対象ウィンドウの参照を保持）
                 let mut pending = PENDING.lock().unwrap();
                 if let Some(old) = pending.take() {
                     CFRelease(old.window.0);
@@ -399,6 +440,7 @@ unsafe extern "C" fn ax_callback(
                     timestamp: CFAbsoluteTimeGetCurrent(),
                 });
             } else {
+                // 非ドラッグ（キーボード操作等）: 即座にスナップ
                 snap_window(element);
             }
         }
@@ -447,7 +489,22 @@ fn try_auto_place(element: AXUIElementRef) -> bool {
             return false;
         };
 
-        // 3. app_rules でマッチング（部分一致、Windows 版と同じロジック）
+        // 3. ウィンドウ位置からモニターを特定（ルールマッチングに先行して必要）
+        let (wx, wy) = match mac_snap::get_window_position(element) {
+            Some(pos) => pos,
+            None => return false,
+        };
+        let monitor = match mac_monitor::monitor_for_point(wx, wy)
+            .or_else(|| mac_monitor::monitor_nearest_point(wx, wy))
+        {
+            Some(m) => m,
+            None => return false,
+        };
+        let monitor_key = format!("{}", monitor.display_id);
+
+        // 4. app_rules で 2 パスマッチング（Windows auto_place.rs と同じ戦略）
+        //    Pass 1: モニター固有ルール（monitor フィールド部分一致）
+        //    Pass 2: 共通ルール（monitor = None）
         let (rule_col, rule_row, rule_cs, rule_rs, grid) = {
             let state = STATE.lock().unwrap();
             let s = match state.as_ref() {
@@ -455,14 +512,30 @@ fn try_auto_place(element: AXUIElementRef) -> bool {
                 None => return false,
             };
 
-            let rule = s.config.app_rules.iter().find(|r| {
-                if let Some(ref exe) = r.exe_name {
+            let matches_app = |rule: &crate::config::AppRule| -> bool {
+                if let Some(ref exe) = rule.exe_name {
                     let exe_lower = exe.to_lowercase();
                     let name_lower = app_name.to_lowercase();
                     name_lower.contains(&exe_lower) || exe_lower.contains(&name_lower)
                 } else {
                     false
                 }
+            };
+
+            // Pass 1: モニター固有ルール
+            let rule = s.config.app_rules.iter().find(|r| {
+                if let Some(ref mon) = r.monitor {
+                    monitor_key.contains(mon.as_str()) && matches_app(r)
+                } else {
+                    false
+                }
+            });
+
+            // Pass 2: 共通ルール（monitor = None）
+            let rule = rule.or_else(|| {
+                s.config.app_rules.iter().find(|r| {
+                    r.monitor.is_none() && matches_app(r)
+                })
             });
 
             let rule = match rule {
@@ -470,29 +543,18 @@ fn try_auto_place(element: AXUIElementRef) -> bool {
                 None => return false,
             };
 
-            // ウィンドウ位置からモニターを特定
-            let (x, y) = match mac_snap::get_window_position(element) {
-                Some(pos) => pos,
-                None => return false,
-            };
-            let monitor = match mac_monitor::monitor_for_point(x, y)
-                .or_else(|| mac_monitor::monitor_nearest_point(x, y))
-            {
-                Some(m) => m,
-                None => return false,
-            };
             let grid = monitor.to_grid(&s.config);
             (rule.col, rule.row, rule.col_span, rule.row_span, grid)
         }; // STATE lock 解放
 
-        // 4. cell_rect でターゲット位置を計算し、配置
+        // 5. cell_rect でターゲット位置を計算し、配置
         let rect = grid.cell_rect(rule_col, rule_row, rule_cs, rule_rs);
         mac_snap::set_window_size(element, rect.w as f64, rect.h as f64);
         mac_snap::set_window_position(element, rect.x as f64, rect.y as f64);
 
         eprintln!(
-            "[GridSnap] F0 auto-place: '{}' -> col={}, row={}, span={}x{} pos=({},{})",
-            app_name, rule_col, rule_row, rule_cs, rule_rs, rect.x, rect.y
+            "[GridSnap] F0 auto-place: '{}' [mon={}] -> col={}, row={}, span={}x{} pos=({},{})",
+            app_name, monitor_key, rule_col, rule_row, rule_cs, rule_rs, rect.x, rect.y
         );
         true
     }
@@ -524,50 +586,27 @@ fn snap_window(element: AXUIElementRef) {
 
 // ──── Timer callbacks ────
 
-/// 150ms タイマー: 保留スナップを処理する。
+/// 150ms タイマー: LeftMouseUp 取りこぼし時の安全ネット。
+/// WINDOW_DRAGGING が true のままマウスが離されている場合にフォールバック処理する。
 extern "C" fn snap_check_callback(
     _timer: CFRunLoopTimerRef,
     _info: *mut c_void,
 ) {
-    let mut pending = PENDING.lock().unwrap();
-    if let Some(p) = pending.as_ref() {
-        let now = unsafe { CFAbsoluteTimeGetCurrent() };
-        if now - p.timestamp > 0.1 && !mac_snap::is_mouse_down() {
-            if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
-                ov.hide();
-            }
-            let window = p.window;
-            snap_window(window.as_ax());
-            unsafe { CFRelease(window.0) };
-            *pending = None;
-        }
-    }
-}
+    if WINDOW_DRAGGING.load(Ordering::SeqCst)
+        && !DRAGGING.load(Ordering::SeqCst)
+        && !mac_snap::is_mouse_down()
+    {
+        WINDOW_DRAGGING.store(false, Ordering::SeqCst);
 
-/// 16ms タイマー: WINDOW_DRAGGING 中にマウス座標でオーバーレイを更新する。
-extern "C" fn overlay_update_callback(
-    _timer: CFRunLoopTimerRef,
-    _info: *mut c_void,
-) {
-    if !WINDOW_DRAGGING.load(Ordering::SeqCst) || !DRAGGING.load(Ordering::SeqCst) {
-        return;
-    }
-    let (mx, my) = *MOUSE_POS.lock().unwrap();
-    if mx == 0.0 && my == 0.0 {
-        return;
-    }
-    let grid = {
-        let state_guard = STATE.lock().unwrap();
-        match state_guard.as_ref() {
-            Some(s) => mac_monitor::monitor_for_point(mx, my)
-                .or_else(|| mac_monitor::monitor_nearest_point(mx, my))
-                .map(|m| m.to_grid(&s.config)),
-            None => None,
-        }
-    };
-    if let Some(grid) = grid {
         if let Some(ov) = OVERLAY.lock().unwrap().as_ref() {
-            ov.show(&grid);
+            ov.hide();
+        }
+        *OVERLAY_BOUNDS.lock().unwrap() = None;
+
+        let pending = PENDING.lock().unwrap().take();
+        if let Some(p) = pending {
+            snap_window(p.window.as_ax());
+            unsafe { CFRelease(p.window.0) };
         }
     }
 }
@@ -695,7 +734,6 @@ pub fn capture_frontmost_window() {
         let monitor_key = format!("{}", monitor.display_id);
 
         // 4. app_rules に upsert -> TOML 保存
-        //    キャプチャ時のモニターを記録し、モニター固有ルールとして保存する。
         let rule = crate::config::AppRule {
             monitor: Some(monitor_key.clone()),
             class_name: None,

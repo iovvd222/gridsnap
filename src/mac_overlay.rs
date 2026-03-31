@@ -126,10 +126,6 @@ impl OverlayWindow {
                 self.rebuild_layers(grid);
             }
 
-            // CATransaction を即時コミット（CGEventTap コールバック内では
-            // 暗黙コミットが Run Loop サイクル末尾まで遅延する場合がある）
-            let _: () = msg_send![class!(CATransaction), flush];
-
             let _: () = msg_send![panel, orderFrontRegardless];
             let _: () = msg_send![panel, display];
 
