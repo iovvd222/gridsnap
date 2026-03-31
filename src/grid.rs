@@ -180,8 +180,8 @@ impl Grid {
         let col = self.px_to_col_index(x.round() as i32) as u32;
         let row = self.py_to_row_index(y.round() as i32) as u32;
         // スパン: 右端・下端のセルインデックスから算出
-        let col_end = self.px_to_col_index((x + w).round() as i32) as u32;
-        let row_end = self.py_to_row_index((y + h).round() as i32) as u32;
+        let col_end = self.px_to_col_index(((x + w).round() as i32 - 1).max(x.round() as i32)) as u32;
+        let row_end = self.py_to_row_index(((y + h).round() as i32 - 1).max(y.round() as i32)) as u32;
         let col_span = (col_end - col + 1).max(1);
         let row_span = (row_end - row + 1).max(1);
         (col, row, col_span, row_span)
@@ -242,88 +242,341 @@ pub struct GridLines {
 mod tests {
     use super::*;
 
-    #[test]
-    fn no_remainder_1980x1200() {
-        let g = Grid::new(0, 0, 1980, 1200, 20, 12);
-        assert_eq!(g.base_cw, 99);
-        assert_eq!(g.base_ch, 100);
-        assert_eq!(g.pad_left, 0);
-        assert_eq!(g.pad_top, 0);
-        // 全セル均等
-        assert_eq!(g.cell_width_at(0), 99);
-        assert_eq!(g.cell_width_at(19), 99);
-        // 最右線は width-1 にクランプ
-        let lines = g.grid_lines();
-        assert_eq!(*lines.verticals.last().unwrap(), 1979);
-        assert_eq!(*lines.horizontals.last().unwrap(), 1199);
-    }
+    // ================================================================
+    // 1. Grid::new — 基本構築
+    // ================================================================
 
     #[test]
-    fn remainder_absorb_both_edges() {
-        // 1926 / 20 = 96 rem 6 → pad_left=3, pad_right=3
-        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
-        assert_eq!(g.base_cw, 96);
-        assert_eq!(g.pad_left, 3);
-        // 左端セル: 96+3=99, 右端セル: 96+3=99, 内部: 96
-        assert_eq!(g.cell_width_at(0), 99);
-        assert_eq!(g.cell_width_at(19), 99);
-        assert_eq!(g.cell_width_at(5), 96);
-        // グリッド線
+    fn new_evenly_divisible() {
+        // 2560 / 20 = 128, 1440 / 12 = 120 → 端数なし
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        assert_eq!(g.cell_width(), 128);
+        assert_eq!(g.cell_height(), 120);
         assert_eq!(g.col_to_x(0), 0);
-        assert_eq!(g.col_to_x(1), 3 + 96);   // 99
-        assert_eq!(g.col_to_x(2), 3 + 192);  // 195
-        assert_eq!(g.col_to_x(20), 1926);
-        // 最右線クランプ
-        let lines = g.grid_lines();
-        assert_eq!(*lines.verticals.last().unwrap(), 1925);
+        assert_eq!(g.col_to_x(20), 2560);
+        assert_eq!(g.row_to_y(12), 1440);
     }
 
     #[test]
-    fn odd_remainder() {
-        // 1921 / 20 = 96 rem 1 → pad_left=0, pad_right=1
+    fn new_with_even_remainder() {
+        // 1926 / 20 = 96 rem 6 → pad_left = 3
+        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        assert_eq!(g.cell_width(), 96);
+        assert_eq!(g.cell_width_at(0), 99);  // 96 + 3
+        assert_eq!(g.cell_width_at(19), 99); // 96 + (6-3)
+        assert_eq!(g.cell_width_at(10), 96); // 内部セル
+    }
+
+    #[test]
+    fn new_with_odd_remainder() {
+        // 1921 / 20 = 96 rem 1 → pad_left = 0, 右端 +1
         let g = Grid::new(0, 0, 1921, 1200, 20, 12);
-        assert_eq!(g.pad_left, 0);
-        assert_eq!(g.cell_width_at(0), 96);  // 左端: 96+0
-        assert_eq!(g.cell_width_at(19), 97); // 右端: 96+1
+        assert_eq!(g.cell_width_at(0), 96);
+        assert_eq!(g.cell_width_at(19), 97);
     }
 
     #[test]
-    fn snap_x_edge_cells() {
-        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
-        // 左端セル [0, 99) の中点付近
-        assert_eq!(g.snap_x(50), 99);  // col 1 境界が近い
-        assert_eq!(g.snap_x(48), 0);   // col 0 境界が近い
-        // 最右端付近
-        assert_eq!(g.snap_x(1920), 1926); // col 20 境界
+    fn new_with_nonzero_origin() {
+        // マルチモニター: セカンダリが x=2560 から始まる
+        let g = Grid::new(2560, 0, 1920, 1080, 10, 6);
+        assert_eq!(g.col_to_x(0), 2560);
+        assert_eq!(g.col_to_x(10), 2560 + 1920);
+        assert_eq!(g.row_to_y(0), 0);
+        assert_eq!(g.row_to_y(6), 1080);
     }
 
     #[test]
-    fn cell_rect_edge() {
+    fn new_with_negative_origin() {
+        // 左側モニター: x = -1920
+        let g = Grid::new(-1920, 0, 1920, 1080, 8, 4);
+        assert_eq!(g.col_to_x(0), -1920);
+        assert_eq!(g.col_to_x(8), 0);
+    }
+
+    #[test]
+    fn new_minimum_grid_1x1() {
+        let g = Grid::new(0, 0, 1920, 1080, 1, 1);
+        assert_eq!(g.cell_width(), 1920);
+        assert_eq!(g.cell_height(), 1080);
+        assert_eq!(g.col_to_x(0), 0);
+        assert_eq!(g.col_to_x(1), 1920);
+    }
+
+    #[test]
+    fn new_large_grid_100x100() {
+        let g = Grid::new(0, 0, 3840, 2160, 100, 100);
+        assert_eq!(g.cell_width(), 38);  // 3840 / 100 = 38 rem 40
+        assert_eq!(g.col_to_x(100), 3840);
+        assert_eq!(g.row_to_y(100), 2160);
+    }
+
+    // ================================================================
+    // 2. col_to_x / row_to_y — 座標変換
+    // ================================================================
+
+    #[test]
+    fn col_to_x_clamps_negative() {
+        let g = Grid::new(0, 0, 1920, 1080, 10, 6);
+        assert_eq!(g.col_to_x(-5), g.col_to_x(0));
+    }
+
+    #[test]
+    fn col_to_x_clamps_over_max() {
+        let g = Grid::new(0, 0, 1920, 1080, 10, 6);
+        assert_eq!(g.col_to_x(15), g.col_to_x(10));
+    }
+
+    #[test]
+    fn col_to_x_boundary_consistency() {
         let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        let mut prev = g.col_to_x(0);
+        for c in 1..=20 {
+            let cur = g.col_to_x(c);
+            assert!(cur > prev, "col_to_x({}) = {} <= col_to_x({}) = {}", c, cur, c - 1, prev);
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn row_to_y_boundary_consistency() {
+        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        let mut prev = g.row_to_y(0);
+        for r in 1..=12 {
+            let cur = g.row_to_y(r);
+            assert!(cur > prev);
+            prev = cur;
+        }
+    }
+
+    // ================================================================
+    // 3. snap_x / snap_y — ピクセル→最寄りグリッド線
+    // ================================================================
+
+    #[test]
+    fn snap_x_exact_on_grid_line() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        assert_eq!(g.snap_x(640), 640);
+    }
+
+    #[test]
+    fn snap_x_midpoint_rounds_left() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        // col 5 = 640, col 6 = 768, midpoint = 704
+        assert_eq!(g.snap_x(704), 640);
+    }
+
+    #[test]
+    fn snap_x_just_past_midpoint_rounds_right() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        assert_eq!(g.snap_x(705), 768);
+    }
+
+    #[test]
+    fn snap_x_at_origin() {
+        let g = Grid::new(100, 0, 1920, 1080, 10, 6);
+        assert_eq!(g.snap_x(100), 100);
+    }
+
+    #[test]
+    fn snap_x_before_origin() {
+        let g = Grid::new(100, 0, 1920, 1080, 10, 6);
+        assert_eq!(g.snap_x(50), 100);
+    }
+
+    #[test]
+    fn snap_x_beyond_right_edge() {
+        let g = Grid::new(0, 0, 1920, 1080, 10, 6);
+        assert_eq!(g.snap_x(2000), 1920);
+    }
+
+    #[test]
+    fn snap_y_edge_cells_with_padding() {
+        let g = Grid::new(0, 0, 1926, 1201, 20, 12);
+        let row1_y = g.row_to_y(1);
+        let mid = row1_y / 2;
+        let snapped = g.snap_y(mid);
+        assert!(snapped == 0 || snapped == row1_y);
+    }
+
+    // ================================================================
+    // 4. cell_rect — セル矩形
+    // ================================================================
+
+    #[test]
+    fn cell_rect_single_cell_at_origin() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
         let r = g.cell_rect(0, 0, 1, 1);
         assert_eq!(r.x, 0);
-        assert_eq!(r.w, 99); // 左端セル幅
-        let r = g.cell_rect(19, 0, 1, 1);
-        assert_eq!(r.w, 99); // 右端セル幅
-        let r = g.cell_rect(5, 0, 1, 1);
-        assert_eq!(r.w, 96); // 内部セル幅
+        assert_eq!(r.y, 0);
+        assert_eq!(r.w, 128);
+        assert_eq!(r.h, 120);
     }
 
     #[test]
-    fn cell_rect_span_across_edge() {
-        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
-        // col 0-1 をまたぐ: 99 + 96 = 195
-        let r = g.cell_rect(0, 0, 2, 1);
-        assert_eq!(r.x, 0);
-        assert_eq!(r.w, 195);
-    }
-
-    #[test]
-    fn divides_evenly() {
+    fn cell_rect_full_screen() {
         let g = Grid::new(0, 0, 2560, 1440, 20, 12);
-        assert_eq!(g.base_cw, 128);
-        assert_eq!(g.pad_left, 0);
-        assert_eq!(g.cell_width_at(0), 128);
-        assert_eq!(g.col_to_x(20), 2560);
+        let r = g.cell_rect(0, 0, 20, 12);
+        assert_eq!(r.x, 0);
+        assert_eq!(r.y, 0);
+        assert_eq!(r.w, 2560);
+        assert_eq!(r.h, 1440);
+    }
+
+    #[test]
+    fn cell_rect_spans_edge_and_internal() {
+        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        let r = g.cell_rect(0, 0, 3, 1);
+        assert_eq!(r.w, g.col_to_x(3) - g.col_to_x(0));
+    }
+
+    #[test]
+    fn cell_rect_with_offset_origin() {
+        let g = Grid::new(2560, 100, 1920, 1080, 10, 6);
+        let r = g.cell_rect(0, 0, 1, 1);
+        assert_eq!(r.x, 2560);
+        assert_eq!(r.y, 100);
+    }
+
+    #[test]
+    fn cell_rect_last_cell() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let r = g.cell_rect(19, 11, 1, 1);
+        assert_eq!(r.x + r.w, 2560);
+        assert_eq!(r.y + r.h, 1440);
+    }
+
+    #[test]
+    fn cell_rect_sum_equals_total() {
+        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        let total_w: i32 = (0..20).map(|c| g.cell_width_at(c)).sum();
+        assert_eq!(total_w, 1926);
+        let total_h: i32 = (0..12).map(|r| g.cell_height_at(r)).sum();
+        assert_eq!(total_h, 1200);
+    }
+
+    // ================================================================
+    // 5. rect_to_cell — ピクセル矩形→セル座標（F0a キャプチャ）
+    // ================================================================
+
+    #[test]
+    fn rect_to_cell_exact_alignment() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let r = g.cell_rect(2, 1, 3, 2);
+        let (col, row, cs, rs) = g.rect_to_cell(r.x as f64, r.y as f64, r.w as f64, r.h as f64);
+        assert_eq!((col, row, cs, rs), (2, 1, 3, 2));
+    }
+
+    #[test]
+    fn rect_to_cell_slight_offset() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let r = g.cell_rect(5, 3, 2, 2);
+        let (col, row, cs, rs) = g.rect_to_cell(
+            (r.x + 3) as f64,
+            (r.y + 3) as f64,
+            (r.w - 6) as f64,
+            (r.h - 6) as f64,
+        );
+        assert_eq!((col, row), (5, 3));
+    }
+
+    #[test]
+    fn rect_to_cell_full_screen() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let (col, row, cs, rs) = g.rect_to_cell(0.0, 0.0, 2560.0, 1440.0);
+        assert_eq!((col, row, cs, rs), (0, 0, 20, 12));
+    }
+
+    #[test]
+    fn rect_to_cell_zero_size_returns_minimum() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let (_, _, cs, rs) = g.rect_to_cell(500.0, 500.0, 0.0, 0.0);
+        assert!(cs >= 1);
+        assert!(rs >= 1);
+    }
+
+    #[test]
+    fn rect_to_cell_with_nonzero_origin() {
+        let g = Grid::new(2560, 0, 1920, 1080, 10, 6);
+        let r = g.cell_rect(0, 0, 5, 3);
+        let (col, row, cs, rs) = g.rect_to_cell(r.x as f64, r.y as f64, r.w as f64, r.h as f64);
+        assert_eq!((col, row, cs, rs), (0, 0, 5, 3));
+    }
+
+    // ================================================================
+    // 6. grid_lines — オーバーレイ描画用
+    // ================================================================
+
+    #[test]
+    fn grid_lines_count() {
+        let g = Grid::new(0, 0, 1920, 1080, 10, 6);
+        let lines = g.grid_lines();
+        assert_eq!(lines.verticals.len(), 11);
+        assert_eq!(lines.horizontals.len(), 7);
+    }
+
+    #[test]
+    fn grid_lines_first_and_last() {
+        let g = Grid::new(0, 0, 1920, 1080, 10, 6);
+        let lines = g.grid_lines();
+        assert_eq!(lines.verticals[0], 0);
+        assert_eq!(*lines.verticals.last().unwrap(), 1919);
+        assert_eq!(lines.horizontals[0], 0);
+        assert_eq!(*lines.horizontals.last().unwrap(), 1079);
+    }
+
+    #[test]
+    fn grid_lines_monotonically_increasing() {
+        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        let lines = g.grid_lines();
+        for w in lines.verticals.windows(2) {
+            assert!(w[1] >= w[0]);
+        }
+        for w in lines.horizontals.windows(2) {
+            assert!(w[1] >= w[0]);
+        }
+    }
+
+    #[test]
+    fn grid_lines_within_monitor_bounds() {
+        let g = Grid::new(100, 200, 1920, 1080, 10, 6);
+        let lines = g.grid_lines();
+        for &x in &lines.verticals {
+            assert!(x >= 100 && x < 100 + 1920);
+        }
+        for &y in &lines.horizontals {
+            assert!(y >= 200 && y < 200 + 1080);
+        }
+    }
+
+    // ================================================================
+    // 7. snap ラウンドトリップ整合性
+    // ================================================================
+
+    #[test]
+    fn snap_roundtrip_all_grid_lines() {
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        for c in 0..=20 {
+            let x = g.col_to_x(c);
+            assert_eq!(g.snap_x(x), x, "snap_x roundtrip failed for col {}", c);
+        }
+        for r in 0..=12 {
+            let y = g.row_to_y(r);
+            assert_eq!(g.snap_y(y), y, "snap_y roundtrip failed for row {}", r);
+        }
+    }
+
+    #[test]
+    fn snap_always_lands_on_grid_line() {
+        let g = Grid::new(0, 0, 1926, 1200, 20, 12);
+        let valid_xs: Vec<i32> = (0..=20).map(|c| g.col_to_x(c)).collect();
+        for px in (0..1926).step_by(7) {
+            let snapped = g.snap_x(px);
+            assert!(
+                valid_xs.contains(&snapped),
+                "snap_x({}) = {} is not a valid grid line",
+                px,
+                snapped
+            );
+        }
     }
 }

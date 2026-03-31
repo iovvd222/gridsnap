@@ -1,45 +1,12 @@
 #![allow(warnings)]
 
-mod config;
-mod grid;
-
-// ──── Windows modules ────
-#[cfg(target_os = "windows")]
-mod monitor;
-#[cfg(target_os = "windows")]
-mod snap;
-#[cfg(target_os = "windows")]
-mod event_hook;
-#[cfg(target_os = "windows")]
-mod overlay;
-#[cfg(target_os = "windows")]
-mod auto_place;
-#[cfg(target_os = "windows")]
-mod titlebar;
-#[cfg(target_os = "windows")]
-mod tray;
-
-// ──── macOS modules ────
-#[cfg(target_os = "macos")]
-mod mac_ffi;
-#[cfg(target_os = "macos")]
-mod mac_monitor;
-#[cfg(target_os = "macos")]
-mod mac_snap;
-#[cfg(target_os = "macos")]
-pub mod mac_overlay; // pub に変更
-#[cfg(target_os = "macos")]
-pub mod mac_event_hook; // pub: mac_tray から update_config を呼ぶため
-#[cfg(target_os = "macos")]
-mod mac_tray;
-
 use anyhow::Result;
-use config::Config;
+use gridsnap::config::Config;
 
 #[cfg(target_os = "windows")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
-use event_hook::EventHookManager;
+use gridsnap::event_hook::EventHookManager;
 
 fn main() -> Result<()> {
     // Per-Monitor DPI Aware V2: 全 Win32 API が物理ピクセル座標を返すようにする
@@ -62,6 +29,16 @@ fn main() -> Result<()> {
         config.grid.columns, config.grid.rows,
     );
 
+    // スタートアップ自動登録
+    #[cfg(target_os = "windows")]
+    if let Err(e) = gridsnap::startup::ensure_registered() {
+        log::warn!("Failed to register startup: {:#}", e);
+    }
+    #[cfg(target_os = "macos")]
+    if let Err(e) = gridsnap::mac_startup::ensure_registered() {
+        log::warn!("Failed to register startup: {:#}", e);
+    }
+
     #[cfg(target_os = "windows")]
     {
         let config = Arc::new(Mutex::new(config));
@@ -71,7 +48,7 @@ fn main() -> Result<()> {
 
         // システムトレイを設置（Columns/Rows 変更 + Capture Position）
         let config_for_tray = config.lock().unwrap().clone();
-        let _tray_hwnd = tray::setup(&config_for_tray);
+        let _tray_hwnd = gridsnap::tray::setup(&config_for_tray);
 
         // Win32 メッセージループ
         // SetWinEventHook はフックを登録したスレッドのメッセージループが必要
@@ -82,12 +59,12 @@ fn main() -> Result<()> {
     {
         // AXObserver + CFRunLoop でイベント駆動
         let config_clone = config.clone();
-        let _hook_manager = mac_event_hook::EventHookManager::new(config)?;
+        let _hook_manager = gridsnap::mac_event_hook::EventHookManager::new(config)?;
         // NSApplication 初期化後、run の前にトレイを設置
         eprintln!("[GridSnap] About to call mac_tray::setup...");
-        mac_tray::setup(&config_clone);
+        gridsnap::mac_tray::setup(&config_clone);
         eprintln!("[GridSnap] mac_tray::setup returned OK");
-        mac_event_hook::run_loop();
+        gridsnap::mac_event_hook::run_loop();
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

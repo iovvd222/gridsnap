@@ -176,3 +176,202 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ================================================================
+    // 1. GridConfig デフォルト値
+    // ================================================================
+
+    #[test]
+    fn default_grid_config() {
+        let gc = GridConfig::default();
+        assert_eq!(gc.columns, 20);
+        assert_eq!(gc.rows, 12);
+    }
+
+    // ================================================================
+    // 2. Config::grid_for_monitor — モニター別解決
+    // ================================================================
+
+    #[test]
+    fn grid_for_monitor_default_when_no_override() {
+        let config = Config::default();
+        let gc = config.grid_for_monitor("\\\\.\\DISPLAY1");
+        assert_eq!(gc.columns, 20);
+        assert_eq!(gc.rows, 12);
+    }
+
+    #[test]
+    fn grid_for_monitor_full_override() {
+        let mut config = Config::default();
+        config.monitor_grids.insert(
+            "\\\\.\\DISPLAY2".into(),
+            MonitorGridConfig { columns: Some(16), rows: Some(8) },
+        );
+        let gc = config.grid_for_monitor("\\\\.\\DISPLAY2");
+        assert_eq!(gc.columns, 16);
+        assert_eq!(gc.rows, 8);
+    }
+
+    #[test]
+    fn grid_for_monitor_partial_override_columns_only() {
+        let mut config = Config::default();
+        config.monitor_grids.insert(
+            "DISPLAY1".into(),
+            MonitorGridConfig { columns: Some(32), rows: None },
+        );
+        let gc = config.grid_for_monitor("DISPLAY1");
+        assert_eq!(gc.columns, 32);
+        assert_eq!(gc.rows, 12);
+    }
+
+    #[test]
+    fn grid_for_monitor_partial_override_rows_only() {
+        let mut config = Config::default();
+        config.monitor_grids.insert(
+            "DISPLAY1".into(),
+            MonitorGridConfig { columns: None, rows: Some(6) },
+        );
+        let gc = config.grid_for_monitor("DISPLAY1");
+        assert_eq!(gc.columns, 20);
+        assert_eq!(gc.rows, 6);
+    }
+
+    // ================================================================
+    // 3. Config::upsert_app_rule
+    // ================================================================
+
+    #[test]
+    fn upsert_app_rule_insert_new() {
+        let mut config = Config::default();
+        assert_eq!(config.app_rules.len(), 0);
+        config.upsert_app_rule(AppRule {
+            monitor: None,
+            class_name: None,
+            exe_name: Some("Code.exe".into()),
+            col: 0, row: 0, col_span: 4, row_span: 4,
+        });
+        assert_eq!(config.app_rules.len(), 1);
+        assert_eq!(config.app_rules[0].col_span, 4);
+    }
+
+    #[test]
+    fn upsert_app_rule_overwrite_existing() {
+        let mut config = Config::default();
+        config.upsert_app_rule(AppRule {
+            monitor: None,
+            class_name: None,
+            exe_name: Some("Code.exe".into()),
+            col: 0, row: 0, col_span: 4, row_span: 4,
+        });
+        config.upsert_app_rule(AppRule {
+            monitor: None,
+            class_name: Some("Chrome_WidgetWin_1".into()),
+            exe_name: Some("Code.exe".into()),
+            col: 5, row: 1, col_span: 3, row_span: 2,
+        });
+        assert_eq!(config.app_rules.len(), 1);
+        assert_eq!(config.app_rules[0].col, 5);
+        assert_eq!(config.app_rules[0].col_span, 3);
+    }
+
+    #[test]
+    fn upsert_app_rule_different_monitor_creates_new() {
+        let mut config = Config::default();
+        config.upsert_app_rule(AppRule {
+            monitor: None,
+            class_name: None,
+            exe_name: Some("Code.exe".into()),
+            col: 0, row: 0, col_span: 4, row_span: 4,
+        });
+        config.upsert_app_rule(AppRule {
+            monitor: Some("DISPLAY2".into()),
+            class_name: None,
+            exe_name: Some("Code.exe".into()),
+            col: 0, row: 0, col_span: 8, row_span: 4,
+        });
+        assert_eq!(config.app_rules.len(), 2);
+    }
+
+    #[test]
+    fn upsert_app_rule_no_exe_name_always_appends() {
+        let mut config = Config::default();
+        config.upsert_app_rule(AppRule {
+            monitor: None,
+            class_name: Some("MyClass".into()),
+            exe_name: None,
+            col: 0, row: 0, col_span: 1, row_span: 1,
+        });
+        config.upsert_app_rule(AppRule {
+            monitor: None,
+            class_name: Some("MyClass".into()),
+            exe_name: None,
+            col: 1, row: 1, col_span: 2, row_span: 2,
+        });
+        assert_eq!(config.app_rules.len(), 2);
+    }
+
+    // ================================================================
+    // 4. TOML シリアライズ/デシリアライズ
+    // ================================================================
+
+    #[test]
+    fn config_roundtrip_toml() {
+        let mut config = Config::default();
+        config.grid.columns = 16;
+        config.grid.rows = 8;
+        config.upsert_app_rule(AppRule {
+            monitor: Some("DISPLAY1".into()),
+            class_name: None,
+            exe_name: Some("firefox.exe".into()),
+            col: 0, row: 0, col_span: 8, row_span: 4,
+        });
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.grid.columns, 16);
+        assert_eq!(parsed.grid.rows, 8);
+        assert_eq!(parsed.app_rules.len(), 1);
+        assert_eq!(parsed.app_rules[0].exe_name.as_deref(), Some("firefox.exe"));
+    }
+
+    #[test]
+    fn config_deserialize_minimal_toml() {
+        let toml_str = r#"
+[grid]
+columns = 8
+rows = 4
+
+[overlay]
+enabled = true
+color_argb = 1073774847
+
+[titlebar]
+hide_for_classes = []
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.grid.columns, 8);
+        assert_eq!(config.app_rules.len(), 0);
+        assert!(config.auto_place_exclude.is_empty());
+    }
+
+    // ================================================================
+    // 5. OverlayConfig / TitlebarConfig デフォルト
+    // ================================================================
+
+    #[test]
+    fn overlay_config_default() {
+        let ov = OverlayConfig::default();
+        assert!(ov.enabled);
+        assert_eq!(ov.color_argb, 0x40_00_80_FF);
+    }
+
+    #[test]
+    fn default_auto_place_exclude() {
+        let config = Config::default();
+        assert!(config.auto_place_exclude.contains(&"Shell_TrayWnd".to_string()));
+        assert!(config.auto_place_exclude.contains(&"tooltips_class32".to_string()));
+    }
+}

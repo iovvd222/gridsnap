@@ -460,3 +460,88 @@ fn find_topmost_foreign_window(my_pid: u32) -> Option<HWND> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::RECT;
+
+    /// infer_drag_edge のコアロジックを RECT ペアから直接テストするヘルパー。
+    /// 本体は HWND + global state 経由なので、ロジック部分だけ抽出。
+    fn detect_edge(pre: &RECT, post: &RECT) -> Option<u32> {
+        let dl = (post.left - pre.left).abs();
+        let dr = (post.right - pre.right).abs();
+        let dt = (post.top - pre.top).abs();
+        let db = (post.bottom - pre.bottom).abs();
+        const THRESH: i32 = 5;
+        let left_moved = dl > THRESH;
+        let right_moved = dr > THRESH;
+        let top_moved = dt > THRESH;
+        let bottom_moved = db > THRESH;
+        let is_move = (dl.abs_diff(dr) <= THRESH as u32)
+            && (dt.abs_diff(db) <= THRESH as u32)
+            && (left_moved || top_moved);
+        if is_move { return None; }
+        match (left_moved, right_moved, top_moved, bottom_moved) {
+            (true,  false, false, false) => Some(WMSZ_LEFT),
+            (false, true,  false, false) => Some(WMSZ_RIGHT),
+            (false, false, true,  false) => Some(WMSZ_TOP),
+            (false, false, false, true)  => Some(WMSZ_BOTTOM),
+            (true,  false, true,  false) => Some(WMSZ_TOPLEFT),
+            (false, true,  true,  false) => Some(WMSZ_TOPRIGHT),
+            (true,  false, false, true)  => Some(WMSZ_BOTTOMLEFT),
+            (false, true,  false, true)  => Some(WMSZ_BOTTOMRIGHT),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn infer_move_uniform_translation() {
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 200, top: 150, right: 600, bottom: 450 };
+        assert_eq!(detect_edge(&pre, &post), None);
+    }
+
+    #[test]
+    fn infer_resize_right_edge() {
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 100, top: 100, right: 600, bottom: 400 };
+        assert_eq!(detect_edge(&pre, &post), Some(WMSZ_RIGHT));
+    }
+
+    #[test]
+    fn infer_resize_left_edge() {
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 50, top: 100, right: 500, bottom: 400 };
+        assert_eq!(detect_edge(&pre, &post), Some(WMSZ_LEFT));
+    }
+
+    #[test]
+    fn infer_resize_bottom_right_corner() {
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 100, top: 100, right: 600, bottom: 500 };
+        assert_eq!(detect_edge(&pre, &post), Some(WMSZ_BOTTOMRIGHT));
+    }
+
+    #[test]
+    fn infer_resize_top_left_corner() {
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 50, top: 50, right: 500, bottom: 400 };
+        assert_eq!(detect_edge(&pre, &post), Some(WMSZ_TOPLEFT));
+    }
+
+    #[test]
+    fn infer_no_movement_returns_none() {
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 102, top: 101, right: 503, bottom: 402 };
+        assert_eq!(detect_edge(&pre, &post), None);
+    }
+
+    #[test]
+    fn infer_at_threshold_not_detected() {
+        // 右辺がちょうど THRESH = 5 → 検出されない
+        let pre = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        let post = RECT { left: 100, top: 100, right: 505, bottom: 400 };
+        assert_eq!(detect_edge(&pre, &post), None);
+    }
+}

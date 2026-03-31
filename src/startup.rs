@@ -12,6 +12,7 @@ use windows::Win32::System::Registry::{
     REG_OPTION_NON_VOLATILE,
 };
 use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 
 const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "GridSnap";
@@ -45,7 +46,7 @@ pub fn unregister() -> Result<()> {
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
             &subkey,
-            0,
+            Some(0),
             None,
             REG_OPTION_NON_VOLATILE,
             KEY_WRITE,
@@ -74,7 +75,7 @@ fn read_current_value() -> Result<String> {
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
             &subkey,
-            0,
+            Some(0),
             None,
             REG_OPTION_NON_VOLATILE,
             KEY_READ,
@@ -136,7 +137,7 @@ fn write_value(exe_path: &str) -> Result<()> {
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
             &subkey,
-            0,
+            Some(0),
             None,
             REG_OPTION_NON_VOLATILE,
             KEY_WRITE,
@@ -159,7 +160,7 @@ fn write_value(exe_path: &str) -> Result<()> {
         let status = RegSetValueExW(
             hkey,
             &name,
-            0,
+            Some(0),
             REG_SZ,
             Some(bytes),
         );

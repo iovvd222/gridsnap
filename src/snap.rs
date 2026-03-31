@@ -221,6 +221,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn touches_top_cases() {
+        assert!(touches_top(WMSZ_TOP));
+        assert!(touches_top(WMSZ_TOPLEFT));
+        assert!(touches_top(WMSZ_TOPRIGHT));
+        assert!(!touches_top(WMSZ_BOTTOM));
+        assert!(!touches_top(WMSZ_LEFT));
+        assert!(!touches_top(WMSZ_RIGHT));
+    }
+
+    #[test]
+    fn touches_bottom_cases() {
+        assert!(touches_bottom(WMSZ_BOTTOM));
+        assert!(touches_bottom(WMSZ_BOTTOMLEFT));
+        assert!(touches_bottom(WMSZ_BOTTOMRIGHT));
+        assert!(!touches_bottom(WMSZ_TOP));
+        assert!(!touches_bottom(WMSZ_LEFT));
+    }
+
+    #[test]
     fn touches_left_cases() {
         assert!(touches_left(WMSZ_LEFT));
         assert!(touches_left(WMSZ_TOPLEFT));
@@ -235,5 +254,21 @@ mod tests {
         assert!(touches_right(WMSZ_TOPRIGHT));
         assert!(touches_right(WMSZ_BOTTOMRIGHT));
         assert!(!touches_right(WMSZ_LEFT));
+    }
+
+    #[test]
+    fn corner_touches_two_edges() {
+        assert!(touches_left(WMSZ_TOPLEFT) && touches_top(WMSZ_TOPLEFT));
+        assert!(touches_right(WMSZ_TOPRIGHT) && touches_top(WMSZ_TOPRIGHT));
+        assert!(touches_left(WMSZ_BOTTOMLEFT) && touches_bottom(WMSZ_BOTTOMLEFT));
+        assert!(touches_right(WMSZ_BOTTOMRIGHT) && touches_bottom(WMSZ_BOTTOMRIGHT));
+    }
+
+    #[test]
+    fn edge_touches_exactly_one_axis() {
+        assert!(touches_left(WMSZ_LEFT) && !touches_top(WMSZ_LEFT) && !touches_bottom(WMSZ_LEFT));
+        assert!(touches_right(WMSZ_RIGHT) && !touches_top(WMSZ_RIGHT) && !touches_bottom(WMSZ_RIGHT));
+        assert!(touches_top(WMSZ_TOP) && !touches_left(WMSZ_TOP) && !touches_right(WMSZ_TOP));
+        assert!(touches_bottom(WMSZ_BOTTOM) && !touches_left(WMSZ_BOTTOM) && !touches_right(WMSZ_BOTTOM));
     }
 }
