@@ -5,8 +5,8 @@ auto_place_exclude = [
 ]
 
 [grid]
-columns = 20
-rows = 12
+columns = 4
+rows = 3
 
 [monitor_grids]
 
