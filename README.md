@@ -6,6 +6,8 @@ OS-native snap features (half/quarter splits) are too coarse. PowerToys FancyZon
 
 GridSnap defines just **one parameter — grid resolution** — and lets each window freely occupy any number of grid cells at runtime. It compresses the zone-definition combinatorial explosion into a single grid resolution setting.
 
+![GridSnap demo](assets/gridsnap.gif)
+
 ---
 
 ## Features

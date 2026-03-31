@@ -10,20 +10,17 @@ use std::path::PathBuf;
 const LABEL: &str = "com.gridsnap.app";
 
 /// LaunchAgent plist を配置してスタートアップ登録する。
-/// 既に同一 exe パスで登録済みならスキップ。
+/// plist が既に存在すれば（パスが異なっていても）スキップする。
+/// 初回起動時のみ登録し、ユーザーが手動で削除した意図を尊重する。
 pub fn ensure_registered() -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current exe path")?;
     let exe_str = exe.to_string_lossy().to_string();
     let plist_path = plist_path()?;
 
-    // 既存 plist を確認
+    // plist が存在すれば初回登録済みとみなす（パス不一致でも上書きしない）
     if plist_path.exists() {
-        if let Ok(content) = fs::read_to_string(&plist_path) {
-            if content.contains(&exe_str) {
-                log::info!("LaunchAgent already registered: {}", exe_str);
-                return Ok(());
-            }
-        }
+        log::info!("LaunchAgent already exists at {:?}, skipping", plist_path);
+        return Ok(());
     }
 
     // ~/Library/LaunchAgents が無ければ作成

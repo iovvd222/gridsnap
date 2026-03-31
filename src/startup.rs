@@ -18,21 +18,21 @@ const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "GridSnap";
 
 /// 現在の exe パスをスタートアップに登録する。
-/// 既に同一パスで登録済みならスキップする。
+/// 既にレジストリ値が存在すれば（パスが異なっていても）スキップする。
+/// 初回起動時のみ登録し、ユーザーが手動で削除した意図を尊重する場合は
+/// unregister() 後の再登録を防ぐためにこの関数を呼ばないこと。
 pub fn ensure_registered() -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current exe path")?;
     let exe_str = exe.to_string_lossy();
 
-    // 既存値を確認
+    // 既存値を確認 — 値が存在すれば（パス不一致でも）初回登録済みとみなす
     if let Ok(existing) = read_current_value() {
-        if existing == exe_str {
-            log::info!("Startup already registered: {}", exe_str);
-            return Ok(());
-        }
+        log::info!("Startup already registered (existing: {}), skipping", existing);
+        return Ok(());
     }
 
     write_value(&exe_str)?;
-    log::info!("Registered startup entry: {}", exe_str);
+    log::info!("Registered startup entry (first run): {}", exe_str);
     Ok(())
 }
 
