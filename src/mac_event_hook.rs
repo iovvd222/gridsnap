@@ -20,6 +20,23 @@ use crate::mac_monitor;
 use crate::mac_snap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// スナップ対象のウィンドウかどうかを判定する。
+/// AXStandardWindow のみを対象とし、IME候補・ポップアップ・ダイアログを除外。
+fn is_snappable_window(element: AXUIElementRef) -> bool {
+    unsafe {
+        let attr = cf_str("AXSubrole");
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(element, attr, &mut value);
+        CFRelease(attr);
+        if err != kAXErrorSuccess || value.is_null() {
+            return false;
+        }
+        let subrole = cf_string_to_string(value as CFStringRef);
+        CFRelease(value);
+        subrole == "AXStandardWindow"
+    }
+}
+
 // ──── Send ラッパー（CoreFoundation ポインタ用）────
 // macOS の AX/CF ポインタはメインスレッド専用だが、
 // 本アプリはシングルスレッド（CFRunLoop）で動作するため安全。
@@ -418,6 +435,9 @@ unsafe extern "C" fn ax_callback(
 
     match notif_str.as_str() {
         "AXWindowMoved" | "AXWindowResized" => {
+            if !is_snappable_window(element) {
+                return;
+            }
             if DRAGGING.load(Ordering::SeqCst) {
                 // ドラッグ中: 初回のみオーバーレイ表示、以後は PENDING 更新のみ
                 let was_window_dragging = WINDOW_DRAGGING.swap(true, Ordering::SeqCst);
@@ -445,6 +465,9 @@ unsafe extern "C" fn ax_callback(
             }
         }
         "AXWindowCreated" => {
+            if !is_snappable_window(element) {
+                return;
+            }
             eprintln!("[GridSnap] AXWindowCreated detected");
             // F0: app_rules にマッチすれば指定セルに配置、そうでなければグリッドスナップ
             if !try_auto_place(element) {
