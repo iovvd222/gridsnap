@@ -127,10 +127,10 @@ pub fn is_mouse_down() -> bool {
     }
 }
 
-/// ウィンドウにスナップを適用する（中心点基準）。
-/// ウィンドウの中心点がどのグリッドセルにあるかを判定し、
-/// 現在のサイズに最も近いセル数にフィットさせる。
-/// メニューバー領域への配置を防ぐため、四辺独立スナップではなくセル単位で動く。
+/// ウィンドウにスナップを適用する。
+/// grid.rect_to_cell で現在矩形を最寄りセル座標に変換し、
+/// grid.cell_rect でピクセル矩形に逆変換して配置する。
+/// 端セルのパディング差異も正しく処理される。
 pub fn apply_snap(window: AXUIElementRef, grid: &Grid) {
     if is_shift_pressed() {
         eprintln!("[GridSnap] apply_snap: Shift pressed, skipping");
@@ -157,35 +157,19 @@ pub fn apply_snap(window: AXUIElementRef, grid: &Grid) {
         x, y, w, h
     );
 
-    let cell_w = grid.cell_width() as f64;
-    let cell_h = grid.cell_height() as f64;
+    // rect_to_cell: 現在矩形 → 最寄りセル座標 (col, row, col_span, row_span)
+    let (col, row, cs, rs) = grid.rect_to_cell(x, y, w, h);
+    // cell_rect: セル座標 → ピクセル矩形（端セルパディング込み）
+    let rect = grid.cell_rect(col, row, cs, rs);
 
-    // ウィンドウが何セル分にまたがるか（最低1セル）
-    let col_span = (w / cell_w).round().max(1.0) as i32;
-    let row_span = (h / cell_h).round().max(1.0) as i32;
-
-    // ウィンドウ中心点
-    let cx = x + w / 2.0;
-    let cy = y + h / 2.0;
-
-    // 中心点がどのセル列・行にあるか（実数）
-    let center_col_f = (cx - grid.origin_x as f64) / cell_w;
-    let center_row_f = (cy - grid.origin_y as f64) / cell_h;
-
-    // スパンの開始セルを中心点から算出し、グリッド範囲にクランプ
-    let start_col = (center_col_f - col_span as f64 / 2.0).round() as i32;
-    let start_row = (center_row_f - row_span as f64 / 2.0).round() as i32;
-    let start_col = start_col.clamp(0, (grid.columns - col_span).max(0));
-    let start_row = start_row.clamp(0, (grid.rows - row_span).max(0));
-
-    let snapped_left = grid.col_to_x(start_col) as f64;
-    let snapped_top = grid.row_to_y(start_row) as f64;
-    let new_w = (col_span * grid.cell_width()) as f64;
-    let new_h = (row_span * grid.cell_height()) as f64;
+    let snapped_left = rect.x as f64;
+    let snapped_top = rect.y as f64;
+    let new_w = rect.w as f64;
+    let new_h = rect.h as f64;
 
     eprintln!(
-        "[GridSnap] apply_snap: center=({:.0},{:.0}) span={}x{} → cell({},{}) pos=({:.0},{:.0}) size=({:.0},{:.0})",
-        cx, cy, col_span, row_span, start_col, start_row, snapped_left, snapped_top, new_w, new_h
+        "[GridSnap] apply_snap: → cell({},{}) span={}x{} pos=({:.0},{:.0}) size=({:.0},{:.0})",
+        col, row, cs, rs, snapped_left, snapped_top, new_w, new_h
     );
 
     let pos_changed = (snapped_left - x).abs() > 0.5 || (snapped_top - y).abs() > 0.5;

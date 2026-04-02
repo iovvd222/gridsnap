@@ -151,12 +151,17 @@ pub fn apply_snap(hwnd: HWND, grid: &Grid, drag_edge: Option<u32>) {
 
     let (new_left, new_top, new_right, new_bottom) = match drag_edge {
         None => {
-            // 移動スナップ: 可視左上を最寄りのグリッド交点に合わせる（F3）
-            let snapped_left = grid.snap_x(vis.left);
-            let snapped_top = grid.snap_y(vis.top);
+            // 移動スナップ: rect_to_cell → cell_rect で位置・サイズともグリッド正規化（F3）
             let vis_w = vis.right - vis.left;
             let vis_h = vis.bottom - vis.top;
-            (snapped_left, snapped_top, snapped_left + vis_w, snapped_top + vis_h)
+            let (col, row, cs, rs) = grid.rect_to_cell(
+                vis.left as f64,
+                vis.top as f64,
+                vis_w as f64,
+                vis_h as f64,
+            );
+            let rect = grid.cell_rect(col, row, cs, rs);
+            (rect.x, rect.y, rect.x + rect.w, rect.y + rect.h)
         }
         Some(edge) => {
             // リサイズスナップ: ドラッグした辺の可視境界を丸める（F2）

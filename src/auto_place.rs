@@ -1,12 +1,11 @@
 /// F0 新規ウィンドウ自動配置。
 /// EVENT_OBJECT_SHOW 直後に呼ばれる。
 /// - app_rules にマッチ → ルール通り配置
-/// - マッチなし → アクティブウィンドウの右隣グリッドセルに配置（重なり許容）
+/// - マッチなし → 現在の位置・サイズを最寄りグリッドセル境界に正規化
 
 use windows::Win32::{
     Foundation::{HWND, RECT},
     UI::WindowsAndMessaging::{
-        GetForegroundWindow,
         GetWindowRect,
         GetClassNameW,
         GetWindowLongW,
@@ -37,8 +36,7 @@ pub fn try_auto_place(hwnd: HWND, grid: &Grid, config: &Config, device_name: &st
         return;
     }
 
-    // フォールバック: アクティブウィンドウの右隣セルに配置
-    place_next_to_active(hwnd, grid);
+    // ルール未登録: 何もしない（ドラッグ/リサイズ時にスナップで正規化される）
 }
 
 /// 自動配置の対象か判定する。
@@ -166,34 +164,6 @@ fn find_matching_rule<'a>(
 /// DWM 不可視ボーダーを自動補償し、可視部分がグリッドに揃う。
 fn apply_rule(hwnd: HWND, grid: &Grid, rule: &AppRule) {
     let rect = grid.cell_rect(rule.col, rule.row, rule.col_span, rule.row_span);
-    set_window_pos_visible(hwnd, rect.x, rect.y, rect.w, rect.h);
-}
-
-/// アクティブウィンドウの右隣グリッドセルに新規ウィンドウを配置する。
-/// 右端を超えた場合は col=0 に折り返す（重なり許容）。
-fn place_next_to_active(hwnd: HWND, grid: &Grid) {
-    let active_right = unsafe {
-        let active = GetForegroundWindow();
-        if active.is_invalid() || active == hwnd {
-            return;
-        }
-        let mut rect = RECT::default();
-        if GetWindowRect(active, &mut rect).is_err() {
-            return;
-        }
-        rect.right
-    };
-
-    // アクティブウィンドウの右端が属するグリッド列を特定し、その右の列に配置
-    let cw = grid.cell_width();
-    if cw <= 0 {
-        return;
-    }
-    let relative_right = active_right - grid.origin_x;
-    let right_col = (relative_right + cw - 1) / cw; // 切り上げ
-    let next_col = right_col.min(grid.columns - 1);
-
-    let rect = grid.cell_rect(next_col as u32, 0, 1, grid.rows as u32);
     set_window_pos_visible(hwnd, rect.x, rect.y, rect.w, rect.h);
 }
 
