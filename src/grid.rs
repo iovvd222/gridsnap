@@ -171,17 +171,29 @@ impl Grid {
         CellRect { x, y, w: x_end - x, h: y_end - y }
     }
 
-    /// ピクセル矩形をグリッドセル座標に逆変換する（F0a キャプチャ用）。
+    /// ピクセル矩形をグリッドセル座標に逆変換する。
+    /// 各辺を最寄りグリッド境界に丸める（四捨五入）ため、
+    /// 端数はみ出しが半セル未満なら縮小方向に倒れる。
     /// 戻り値: (col, row, col_span, row_span)
     pub fn rect_to_cell(&self, x: f64, y: f64, w: f64, h: f64) -> (u32, u32, u32, u32) {
         if self.base_cw <= 0 || self.base_ch <= 0 {
             return (0, 0, 1, 1);
         }
-        let col = self.px_to_col_index(x.round() as i32) as u32;
-        let row = self.py_to_row_index(y.round() as i32) as u32;
-        // スパン: 右端・下端のセルインデックスから算出
-        let col_end = self.px_to_col_index(((x + w).round() as i32 - 1).max(x.round() as i32)) as u32;
-        let row_end = self.py_to_row_index(((y + h).round() as i32 - 1).max(y.round() as i32)) as u32;
+
+        // 4辺を最寄りグリッド線にスナップ
+        let snapped_left = self.snap_x(x.round() as i32);
+        let snapped_top = self.snap_y(y.round() as i32);
+        let snapped_right = self.snap_x((x + w).round() as i32);
+        let snapped_bottom = self.snap_y((y + h).round() as i32);
+
+        // スナップ後の左上 → セルインデックス
+        let col = self.px_to_col_index(snapped_left) as u32;
+        let row = self.py_to_row_index(snapped_top) as u32;
+
+        // スナップ後の右下 → セルインデックス（-1 で境界上を手前セルに倒す）
+        let col_end = self.px_to_col_index((snapped_right - 1).max(snapped_left)) as u32;
+        let row_end = self.py_to_row_index((snapped_bottom - 1).max(snapped_top)) as u32;
+
         let col_span = (col_end - col + 1).max(1);
         let row_span = (row_end - row + 1).max(1);
         (col, row, col_span, row_span)
@@ -500,6 +512,64 @@ mod tests {
         let r = g.cell_rect(0, 0, 5, 3);
         let (col, row, cs, rs) = g.rect_to_cell(r.x as f64, r.y as f64, r.w as f64, r.h as f64);
         assert_eq!((col, row, cs, rs), (0, 0, 5, 3));
+    }
+
+    #[test]
+    fn rect_to_cell_shrinks_small_overshoot() {
+        // 右端が次セルに数px はみ出し → 縮小方向に丸まる（スパン増えない）
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let r = g.cell_rect(5, 3, 3, 2);
+        // 右端・下端を 10px はみ出させる（セル幅128, 高さ120 の半分未満）
+        let (col, row, cs, rs) = g.rect_to_cell(
+            r.x as f64, r.y as f64,
+            (r.w + 10) as f64, (r.h + 10) as f64,
+        );
+        assert_eq!((col, row, cs, rs), (5, 3, 3, 2), "small overshoot should not increase span");
+    }
+
+    #[test]
+    fn rect_to_cell_expands_large_overshoot() {
+        // 右端がセル幅の半分以上はみ出し → 拡大方向に丸まる
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let r = g.cell_rect(5, 3, 3, 2);
+        // セル幅128 の半分超 = 65px 以上はみ出し
+        let (col, row, cs, rs) = g.rect_to_cell(
+            r.x as f64, r.y as f64,
+            (r.w + 70) as f64, (r.h + 65) as f64,
+        );
+        assert_eq!((cs, rs), (4, 3), "large overshoot should increase span");
+    }
+
+    #[test]
+    fn rect_to_cell_stable_after_roundtrip() {
+        // cell_rect → rect_to_cell → cell_rect が冪等であることを全セルで検証
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        for col in 0..18 {
+            for row in 0..10 {
+                let r1 = g.cell_rect(col, row, 3, 2);
+                let (c, r, cs, rs) = g.rect_to_cell(r1.x as f64, r1.y as f64, r1.w as f64, r1.h as f64);
+                let r2 = g.cell_rect(c, r, cs, rs);
+                assert_eq!((r1.x, r1.y, r1.w, r1.h), (r2.x, r2.y, r2.w, r2.h),
+                    "roundtrip unstable at col={}, row={}", col, row);
+            }
+        }
+    }
+
+    #[test]
+    fn rect_to_cell_dwm_drift_tolerance() {
+        // DWM ボーダー補償で 1-2px ずれても正規化済みサイズが維持される
+        let g = Grid::new(0, 0, 2560, 1440, 20, 12);
+        let r = g.cell_rect(4, 2, 5, 3);
+        for dx in -2i32..=2 {
+            for dy in -2i32..=2 {
+                let (_, _, cs, rs) = g.rect_to_cell(
+                    (r.x + dx) as f64, (r.y + dy) as f64,
+                    (r.w - dx) as f64, (r.h - dy) as f64,
+                );
+                assert_eq!((cs, rs), (5, 3),
+                    "DWM drift ({},{}) should not change span", dx, dy);
+            }
+        }
     }
 
     // ================================================================
