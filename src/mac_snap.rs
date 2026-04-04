@@ -127,11 +127,62 @@ pub fn is_mouse_down() -> bool {
     }
 }
 
+/// ドラッグ前後の矩形差分から動いた辺を推定する。
+/// 全辺が同程度にシフトしていれば移動（None）と判定する。
+struct DragEdge {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+fn infer_drag_edge(
+    pre: (f64, f64, f64, f64),  // (x, y, w, h)
+    post: (f64, f64, f64, f64),
+) -> Option<DragEdge> {
+    let dl = (post.0 - pre.0).abs();
+    let dr = ((post.0 + post.2) - (pre.0 + pre.2)).abs();
+    let dt = (post.1 - pre.1).abs();
+    let db = ((post.1 + post.3) - (pre.1 + pre.3)).abs();
+
+    const THRESH: f64 = 5.0;
+
+    let left_moved = dl > THRESH;
+    let right_moved = dr > THRESH;
+    let top_moved = dt > THRESH;
+    let bottom_moved = db > THRESH;
+
+    // 移動判定: 左右同量 かつ 上下同量
+    let is_move = (dl - dr).abs() <= THRESH
+        && (dt - db).abs() <= THRESH
+        && (left_moved || top_moved);
+
+    if is_move {
+        return None;
+    }
+
+    // どの辺も動いていない場合も移動扱い
+    if !left_moved && !right_moved && !top_moved && !bottom_moved {
+        return None;
+    }
+
+    Some(DragEdge {
+        left: left_moved,
+        right: right_moved,
+        top: top_moved,
+        bottom: bottom_moved,
+    })
+}
+
 /// ウィンドウにスナップを適用する。
-/// grid.rect_to_cell で現在矩形を最寄りセル座標に変換し、
-/// grid.cell_rect でピクセル矩形に逆変換して配置する。
-/// 端セルのパディング差異も正しく処理される。
-pub fn apply_snap(window: AXUIElementRef, grid: &Grid) {
+/// `pre_drag_rect` が Some の場合、ドラッグ前後の差分から辺を推定し、
+/// リサイズならドラッグ辺のみスナップ、移動なら rect_to_cell → cell_rect で正規化する。
+/// `pre_drag_rect` が None の場合（非ドラッグ操作・新規ウィンドウ）は全辺正規化。
+pub fn apply_snap(
+    window: AXUIElementRef,
+    grid: &Grid,
+    pre_drag_rect: Option<(f64, f64, f64, f64)>,
+) {
     if is_shift_pressed() {
         eprintln!("[GridSnap] apply_snap: Shift pressed, skipping");
         return;
@@ -157,22 +208,45 @@ pub fn apply_snap(window: AXUIElementRef, grid: &Grid) {
         x, y, w, h
     );
 
-    // rect_to_cell: 現在矩形 → 最寄りセル座標 (col, row, col_span, row_span)
-    let (col, row, cs, rs) = grid.rect_to_cell(x, y, w, h);
-    // cell_rect: セル座標 → ピクセル矩形（端セルパディング込み）
-    let rect = grid.cell_rect(col, row, cs, rs);
+    let edge = pre_drag_rect.and_then(|pre| infer_drag_edge(pre, (x, y, w, h)));
 
-    let snapped_left = rect.x as f64;
-    let snapped_top = rect.y as f64;
-    let new_w = rect.w as f64;
-    let new_h = rect.h as f64;
+    let (new_x, new_y, new_w, new_h) = match edge {
+        Some(ref e) => {
+            // リサイズ: ドラッグした辺のみ最寄りグリッド線にスナップ、固定辺は維持
+            let left   = if e.left   { grid.snap_x(x as i32) as f64 }       else { x };
+            let top    = if e.top    { grid.snap_y(y as i32) as f64 }        else { y };
+            let right  = if e.right  { grid.snap_x((x + w) as i32) as f64 }  else { x + w };
+            let bottom = if e.bottom { grid.snap_y((y + h) as i32) as f64 }   else { y + h };
+            let sw = right - left;
+            let sh = bottom - top;
+            if sw <= 0.0 || sh <= 0.0 {
+                eprintln!("[GridSnap] apply_snap: degenerate rect after resize snap, skipping");
+                return;
+            }
+            eprintln!(
+                "[GridSnap] apply_snap: resize snap edges(L={},R={},T={},B={})",
+                e.left, e.right, e.top, e.bottom
+            );
+            (left, top, sw, sh)
+        }
+        None => {
+            // 移動（または非ドラッグ操作）: rect_to_cell → cell_rect で全辺正規化
+            let (col, row, cs, rs) = grid.rect_to_cell(x, y, w, h);
+            let rect = grid.cell_rect(col, row, cs, rs);
+            eprintln!(
+                "[GridSnap] apply_snap: move snap → cell({},{}) span={}x{}",
+                col, row, cs, rs
+            );
+            (rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64)
+        }
+    };
 
     eprintln!(
-        "[GridSnap] apply_snap: → cell({},{}) span={}x{} pos=({:.0},{:.0}) size=({:.0},{:.0})",
-        col, row, cs, rs, snapped_left, snapped_top, new_w, new_h
+        "[GridSnap] apply_snap: → pos=({:.0},{:.0}) size=({:.0},{:.0})",
+        new_x, new_y, new_w, new_h
     );
 
-    let pos_changed = (snapped_left - x).abs() > 0.5 || (snapped_top - y).abs() > 0.5;
+    let pos_changed = (new_x - x).abs() > 0.5 || (new_y - y).abs() > 0.5;
     let size_changed = (new_w - w).abs() > 0.5 || (new_h - h).abs() > 0.5;
 
     if size_changed {
@@ -180,7 +254,7 @@ pub fn apply_snap(window: AXUIElementRef, grid: &Grid) {
         eprintln!("[GridSnap] apply_snap: set_size={}", ok);
     }
     if pos_changed {
-        let ok = set_window_position(window, snapped_left, snapped_top);
+        let ok = set_window_position(window, new_x, new_y);
         eprintln!("[GridSnap] apply_snap: set_position={}", ok);
     }
     if !pos_changed && !size_changed {

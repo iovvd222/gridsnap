@@ -80,6 +80,9 @@ static WINDOW_DRAGGING: AtomicBool = AtomicBool::new(false);
 /// ドラッグ中のモニター境界越え判定に使用する。
 static OVERLAY_BOUNDS: Mutex<Option<CGRect>> = Mutex::new(None);
 
+/// ドラッグ開始時のウィンドウ矩形 (x, y, w, h)。辺推定用。
+static PRE_DRAG_RECT: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
 // ──── Public API ────
 
 pub struct EventHookManager;
@@ -236,11 +239,12 @@ unsafe extern "C" fn drag_event_callback(
                 }
                 *OVERLAY_BOUNDS.lock().unwrap() = None;
 
-                // ウィンドウドラッグだった場合、スナップ適用
+                // ウィンドウドラッグだった場合、スナップ適用（PRE_DRAG_RECT を渡す）
                 if was_window_dragging {
                     let pending = PENDING.lock().unwrap().take();
+                    let pre_drag = PRE_DRAG_RECT.lock().unwrap().take();
                     if let Some(p) = pending {
-                        snap_window(p.window.as_ax());
+                        snap_window_with_pre_drag(p.window.as_ax(), pre_drag);
                         CFRelease(p.window.0);
                     }
                 }
@@ -443,8 +447,12 @@ unsafe extern "C" fn ax_callback(
                 let was_window_dragging = WINDOW_DRAGGING.swap(true, Ordering::SeqCst);
 
                 if !was_window_dragging {
-                    // 初回検出: ウィンドウ位置からモニターを特定しオーバーレイ表示
-                    if let Some((wx, wy)) = mac_snap::get_window_position(element) {
+                    // 初回検出: ドラッグ開始RECTを保存（辺推定用）
+                    if let (Some((wx, wy)), Some((ww, wh))) = (
+                        mac_snap::get_window_position(element),
+                        mac_snap::get_window_size(element),
+                    ) {
+                        *PRE_DRAG_RECT.lock().unwrap() = Some((wx, wy, ww, wh));
                         show_overlay_for_point(wx, wy);
                     }
                 }
@@ -460,8 +468,8 @@ unsafe extern "C" fn ax_callback(
                     timestamp: CFAbsoluteTimeGetCurrent(),
                 });
             } else {
-                // 非ドラッグ（キーボード操作等）: 即座にスナップ
-                snap_window(element);
+                // 非ドラッグ（キーボード操作等）: 即座にスナップ（pre_drag なし）
+                snap_window_with_pre_drag(element, None);
             }
         }
         "AXWindowCreated" => {
@@ -471,7 +479,7 @@ unsafe extern "C" fn ax_callback(
             eprintln!("[GridSnap] AXWindowCreated detected");
             // F0: app_rules にマッチすれば指定セルに配置、そうでなければグリッドスナップ
             if !try_auto_place(element) {
-                snap_window(element);
+                snap_window_with_pre_drag(element, None);
             }
         }
         _ => {}
@@ -584,7 +592,11 @@ fn try_auto_place(element: AXUIElementRef) -> bool {
 }
 
 /// ウィンドウにスナップを適用する（グリッド取得を含む）。
-fn snap_window(element: AXUIElementRef) {
+/// `pre_drag` が Some の場合、ドラッグ前後の差分から辺を推定する。
+fn snap_window_with_pre_drag(
+    element: AXUIElementRef,
+    pre_drag: Option<(f64, f64, f64, f64)>,
+) {
     let (x, y) = match mac_snap::get_window_position(element) {
         Some(pos) => pos,
         None => return,
@@ -604,7 +616,7 @@ fn snap_window(element: AXUIElementRef) {
     };
     let grid = monitor.to_grid(&state.config);
 
-    mac_snap::apply_snap(element, &grid);
+    mac_snap::apply_snap(element, &grid, pre_drag);
 }
 
 // ──── Timer callbacks ────
@@ -627,8 +639,9 @@ extern "C" fn snap_check_callback(
         *OVERLAY_BOUNDS.lock().unwrap() = None;
 
         let pending = PENDING.lock().unwrap().take();
+        let pre_drag = PRE_DRAG_RECT.lock().unwrap().take();
         if let Some(p) = pending {
-            snap_window(p.window.as_ax());
+            snap_window_with_pre_drag(p.window.as_ax(), pre_drag);
             unsafe { CFRelease(p.window.0) };
         }
     }
