@@ -144,18 +144,18 @@ impl OverlayWindow {
 
         // CGColor を CoreGraphics API で直接作成（autorelease 依存を排除）
         let color_space: id = CGColorSpaceCreateDeviceRGB();
-        let components: [f64; 4] = [1.0, 0.5, 0.0, 0.8]; // orange, alpha=0.8
-        let cg_orange: id = CGColorCreate(color_space, components.as_ptr());
+        let components: [f64; 4] = [0.0, 0.502, 1.0, 0.8]; // blue (R0 G128 B255), alpha=0.8 — Windows版と同色
+        let cg_blue: id = CGColorCreate(color_space, components.as_ptr());
         CGColorSpaceRelease(color_space);
 
         let layer_class = class!(CALayer);
         let lines = grid.grid_lines();
-        let thickness = 2.0_f64;
+        let thickness = 1.0_f64;
 
         for &x in &lines.verticals {
             let local_x = (x - grid.origin_x) as f64;
             let line: id = msg_send![layer_class, layer];
-            let _: () = msg_send![line, setBackgroundColor:cg_orange];
+            let _: () = msg_send![line, setBackgroundColor:cg_blue];
             let lf = NSRect::new(
                 NSPoint::new(local_x, 0.),
                 NSSize::new(thickness, grid.height as f64),
@@ -167,7 +167,7 @@ impl OverlayWindow {
         for &y in &lines.horizontals {
             let local_y = (y - grid.origin_y) as f64;
             let line: id = msg_send![layer_class, layer];
-            let _: () = msg_send![line, setBackgroundColor:cg_orange];
+            let _: () = msg_send![line, setBackgroundColor:cg_blue];
             let lf = NSRect::new(
                 NSPoint::new(0., local_y),
                 NSSize::new(grid.width as f64, thickness),
@@ -176,7 +176,7 @@ impl OverlayWindow {
             let _: () = msg_send![root_layer, addSublayer:line];
         }
 
-        CGColorRelease(cg_orange);
+        CGColorRelease(cg_blue);
 
         // --- 中央線を赤で描画 ---
         let color_space2: id = CGColorSpaceCreateDeviceRGB();
@@ -184,7 +184,7 @@ impl OverlayWindow {
         let cg_red: id = CGColorCreate(color_space2, red_components.as_ptr());
         CGColorSpaceRelease(color_space2);
 
-        let center_thickness = 3.0_f64;
+        let center_thickness = 2.0_f64;
 
         // 垂直中央線
         let mid_col = grid.columns as usize / 2;
