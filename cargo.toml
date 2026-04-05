@@ -49,3 +49,15 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[package.metadata.packager]
+product-name = "GridSnap"
+identifier = "com.iovvd222.gridsnap"
+version = "0.2.0"
+icons = ["assets/icon.png"]   # 256x256以上のPNG
+
+[package.metadata.packager.windows]
+# WiX で .msi を生成（WiX は自動ダウンロードされる）
+
+[package.metadata.packager.macos]
+minimum-system-version = "12.0"
