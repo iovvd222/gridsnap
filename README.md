@@ -31,7 +31,7 @@ GridSnap defines just **one parameter — grid resolution** — and lets each wi
 
 ### Windows
 
-1. Download the latest `gridsnap.exe` from [Releases](https://github.com/iovvd222/gridsnap/releases/download/v1.0.0/gridsnap.exe)
+1. Download the latest `gridsnap.exe` from [here](https://github.com/iovvd222/gridsnap/releases/download/v1.0.0/gridsnap.exe)
 2. Run the `.exe` and follow the installer prompts
 3. GridSnap launches automatically after installation and stays in the system tray
 
@@ -39,7 +39,7 @@ GridSnap registers itself to start automatically on Windows logon.
 
 ### macOS
 
-1. Download the latest `gridsnap.dmg` from [Releases](https://github.com/iovvd222/gridsnap/releases/download/v1.0.0/gridsnap.dmg)
+1. Download the latest `gridsnap.dmg` from [here](https://github.com/iovvd222/gridsnap/releases/download/v1.0.0/gridsnap.dmg)
 2. Open the `.dmg` and drag GridSnap to the Applications folder
 3. On first launch, grant accessibility permission in **System Settings → Privacy & Security → Accessibility**
 
