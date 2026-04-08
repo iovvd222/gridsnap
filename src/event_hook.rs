@@ -239,6 +239,13 @@ fn infer_drag_edge(hwnd: HWND) -> Option<u32> {
     }
 }
 
+// ──── Public: Config アクセサ ────
+
+/// auto_place から Config を参照するための公開アクセサ。
+pub fn get_config() -> Option<Arc<Mutex<Config>>> {
+    CONFIG.lock().unwrap().clone()
+}
+
 // ──── Public: Config の動的更新 ────
 
 /// 外部（tray）から Config を更新する。

@@ -77,12 +77,24 @@ fn main() -> Result<()> {
 
 /// Win32 メッセージループ。
 /// WM_QUIT を受け取るまでブロックする。
+/// スレッドメッセージ（hwnd == 0）のカスタムメッセージもここで処理する。
 #[cfg(target_os = "windows")]
 fn message_loop() {
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, TranslateMessage, DispatchMessageW, MSG};
+    use gridsnap::auto_place::{WM_GRIDSNAP_AUTO_PLACE, handle_deferred_auto_place};
+
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // スレッドメッセージ（PostMessageW(None, ...) で投函されたもの）
+            // は DispatchMessageW では配送されないため、ここで直接処理する。
+            if msg.message == WM_GRIDSNAP_AUTO_PLACE {
+                let target_hwnd = HWND(msg.wParam.0 as *mut _);
+                handle_deferred_auto_place(target_hwnd);
+                continue;
+            }
+
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
